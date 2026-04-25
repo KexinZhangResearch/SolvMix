@@ -1,0 +1,24 @@
+train:
+  loss_type: mse
+  log_aux_train_loss: false
+  use_smooth: false
+  lambda_cond_smooth: 0.01
+  lambda_emb_smooth: 0.01
+  lambda_sparse: 0.0
+  smooth_T_std: 0.5
+  smooth_c_std: 0.01
+
+  epochs: 5000
+  learning_rate: 3.0e-4
+  weight_decay: 1.0e-5
+  optimizer: AdamW
+  warmup_steps: 500
+  lr_gamma: 0.99995
+  grad_clip_val: 0.5
+
+  devices: 1
+  precision: "32"
+  test_interval: 5
+
+  use_ema: true
+  ema_decay: 0.999

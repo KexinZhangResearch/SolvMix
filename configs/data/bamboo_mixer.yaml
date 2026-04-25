@@ -1,0 +1,8 @@
+data:
+  dataset_name: bamboo_mixer
+  batch_size: 512
+  max_samples: 100000
+  num_workers: 4
+  seq_len: 16
+  train_ratio: 0.7
+  val_ratio: 0.2

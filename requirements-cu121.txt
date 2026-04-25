@@ -1,0 +1,19 @@
+--index-url https://pypi.tuna.tsinghua.edu.cn/simple
+--extra-index-url https://download.pytorch.org/whl/cu121
+--find-links https://data.pyg.org/whl/torch-2.1.0+cu121.html
+
+torch==2.1.0+cu121
+torchvision==0.16.0+cu121
+torchmetrics==1.9.0
+torchaudio==2.1.0+cu121
+torch-scatter==2.1.2+pt21cu121
+torch-sparse==0.6.18+pt21cu121
+torch-cluster==1.6.3+pt21cu121
+torch-spline-conv==1.2.2+pt21cu121
+torch-geometric==2.6.1
+rdkit==2022.9.5
+pytorch-lightning>=2.0
+omegaconf
+numpy
+pandas
+wandb

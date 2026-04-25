@@ -1,0 +1,13 @@
+# SolvMix base configuration
+# Use OmegaConf-style defaults to compose data / model / train configs.
+defaults:
+  - data: calisol
+  - model: default
+  - train: default
+
+# Experiment meta
+proj_name: SolvMix
+exp_name: SolvMix_v1
+seed: 42
+test_only: false
+compile: false
