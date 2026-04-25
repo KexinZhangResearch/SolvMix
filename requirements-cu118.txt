@@ -14,8 +14,10 @@ torch-geometric==2.6.1
 rdkit==2022.9.5
 pytorch-lightning>=2.0
 omegaconf
+hydra-core
 numpy==1.26.4
 pandas
 wandb
 networkx
 sympy
+

@@ -1,13 +1,13 @@
 #!/bin/bash
-# SolvMix training launcher
+# SolvMix training launcher (Hydra)
 # Usage:
-#   ./trainer.sh
-#   ./trainer.sh --config base
-#   SOLVMIX_GPU=0 ./trainer.sh           # use GPU 0 only
-#   SOLVMIX_GPU=0,1 ./trainer.sh         # use GPUs 0 and 1
-#   SOLVMIX_GPU=2 ./trainer.sh --config base --custom_arg
+#   ./trainer.sh                           # default config (base)
+#   ./trainer.sh experiments=debug         # load experiment config
+#   ./trainer.sh ++train.learning_rate=1e-3   # override learning rate
+#   SOLVMIX_GPU=0 ./trainer.sh             # use GPU 0 only
+#   SOLVMIX_GPU=0,1 ./trainer.sh           # use GPUs 0 and 1
 #
-# To switch dataset, either edit configs/base.yaml or create a new config.
+# To switch dataset, edit configs/base.yaml or create a new experiment config.
 
 cd "$(dirname "$0")/.."
 
@@ -17,4 +17,4 @@ if [ -n "$SOLVMIX_GPU" ]; then
     echo "[trainer.sh] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 fi
 
-python -m SolvMix.trainer --config base "$@"
+python -m SolvMix.trainer "$@"

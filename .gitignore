@@ -226,3 +226,4 @@ activate.sh
 processed/
 configs/experiments
 raw/*.json
+outputs/

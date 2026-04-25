@@ -52,27 +52,19 @@ python -c "import torch; print(torch.__version__); print(torch.cuda.is_available
 
 ### Training
 
-The easiest way to start training is using the provided shell script:
+The project uses [Hydra](https://hydra.cc/) for configuration management. The easiest way to start training is using the provided shell script:
 
 ```bash
 ./trainer.sh
 ```
 
-Or explicitly specify a config:
-
-```bash
-./trainer.sh --config base
-```
-
 #### Experiment Configs
 
-Place experiment-specific configs under `configs/experiments/` and inherit from `base`:
+Place experiment-specific configs under `configs/experiments/`. They will automatically override the base config:
 
 ```yaml
 # configs/experiments/my_exp.yaml
-defaults:
-  - base
-
+# @package _global_
 exp_name: my_experiment
 data:
   seq_len: 128
@@ -80,16 +72,25 @@ train:
   learning_rate: 1.0e-3
 ```
 
-Run it by name (the loader automatically falls back to `configs/experiments/`):
+Run an experiment by name:
 
 ```bash
-./trainer.sh --config my_exp
+./trainer.sh experiments=my_exp
 ```
 
-You can also use the full path:
+#### Override any parameter from the command line
+
+Hydra allows you to override any config value without editing files:
 
 ```bash
-./trainer.sh --config experiments/my_exp
+# Override learning rate
+./trainer.sh ++train.learning_rate=1.0e-3
+
+# Switch dataset
+./trainer.sh data=edb1
+
+# Combine experiment + overrides
+./trainer.sh experiments=debug ++train.epochs=50
 ```
 
 #### Specify GPU(s)

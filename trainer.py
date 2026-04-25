@@ -2,10 +2,11 @@ import glob
 import os
 from functools import partial
 
+import hydra
 import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 
@@ -280,24 +281,10 @@ class SolvMixOptimizerCallback(pl.Callback):
 # ================== Runner ==================
 
 
-def main(cfg=None):
-    if cfg is None:
-        import argparse
-        parser = argparse.ArgumentParser()
-        parser.add_argument("--config", type=str, default="base",
-                            help="Config name under SolvMix/configs/ (without .yaml)")
-        parser.add_argument("--wandb_api_key", type=str, default=None,
-                            help="Optional wandb API key (overrides config and env var)")
-        args = parser.parse_args()
-        cfg = load_config(args.config)
-        # Priority: CLI > config > global env
-        if args.wandb_api_key:
-            os.environ["WANDB_API_KEY"] = args.wandb_api_key
-        elif getattr(cfg, "wandb_api_key", None):
-            os.environ["WANDB_API_KEY"] = cfg.wandb_api_key
-    else:
-        if getattr(cfg, "wandb_api_key", None):
-            os.environ["WANDB_API_KEY"] = cfg.wandb_api_key
+@hydra.main(config_path="configs", config_name="base", version_base=None)
+def main(cfg: DictConfig) -> None:
+    if getattr(cfg, "wandb_api_key", None):
+        os.environ["WANDB_API_KEY"] = cfg.wandb_api_key
 
     if cfg.data.num_workers > 0:
         import torch.multiprocessing as mp
