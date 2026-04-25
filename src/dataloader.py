@@ -1,3 +1,4 @@
+from collections import defaultdict
 from functools import partial
 from typing import Tuple
 
@@ -5,7 +6,25 @@ import torch
 from torch.utils.data import DataLoader
 from torch_geometric.data import Batch, Data
 
-from .dataset import UnifiedDataset
+from .dataset import UnifiedDataset, salt_list
+
+
+class _CachedDataLoader:
+    """Wraps a single pre-computed batch to eliminate CPU collate overhead.
+
+    For full-batch training the collated result is identical every epoch
+    (sample indices are always 0..B-1), so we compute it once and replay it.
+    """
+
+    def __init__(self, dataloader):
+        self._batch = next(iter(dataloader))
+        self._len = 1
+
+    def __iter__(self):
+        yield self._batch
+
+    def __len__(self):
+        return self._len
 
 
 def unified_collate_fn(batch, device="cpu"):
@@ -28,8 +47,6 @@ def unified_collate_fn(batch, device="cpu"):
     y_values = torch.empty(batch_size, dtype=torch.float32)
     T_values = torch.empty(batch_size, dtype=torch.float32)
     c_values = torch.empty(batch_size, dtype=torch.float32)
-    from .dataset import salt_list
-
     salt_one_hot = torch.zeros(batch_size, len(salt_list), dtype=torch.float32)
 
     for idx, item in enumerate(batch):
@@ -143,8 +160,6 @@ def unified_collate_fn(batch, device="cpu"):
         )
 
     # ---------- CPU 上预计算 inter_edge_index（无 GPU 同步） ----------
-    from collections import defaultdict
-
     ranges = []  # (atom_start, atom_end, batch_idx)
     for g_idx, b_idx in enumerate(g2b_solvent):
         ranges.append((int(ptr[g_idx]), int(ptr[g_idx + 1]), b_idx))
@@ -247,10 +262,35 @@ def build_dataloaders(cfg) -> Tuple[DataLoader, DataLoader, DataLoader]:
     if num_workers > 0:
         loader_kwargs["prefetch_factor"] = 4
 
-    make_loader = partial(
-        DataLoader, batch_size=int(data_cfg.batch_size), **loader_kwargs
-    )
-    train_loader = make_loader(train_set, shuffle=True)
-    val_loader = make_loader(val_set, shuffle=False)
-    test_loader = make_loader(test_set, shuffle=False)
+    bs = data_cfg.get("batch_size")
+    if bs is None:
+        # Full-batch mode: each loader uses the full length of its dataset.
+        # We cache the collated batch so that the heavy CPU work in collate_fn
+        # (especially inter_edge_index construction) is done only once.
+        # Force num_workers=0 to avoid expensive worker IPC serialization
+        # for a single giant batch.
+        fb_kwargs = dict(loader_kwargs)
+        fb_kwargs["num_workers"] = 0
+        fb_kwargs["pin_memory"] = False
+        fb_kwargs["persistent_workers"] = False
+        fb_kwargs.pop("prefetch_factor", None)
+        _train = DataLoader(
+            train_set, batch_size=len(train_set), shuffle=True, **fb_kwargs
+        )
+        _val = DataLoader(
+            val_set, batch_size=len(val_set), shuffle=False, **fb_kwargs
+        )
+        _test = DataLoader(
+            test_set, batch_size=len(test_set), shuffle=False, **fb_kwargs
+        )
+        train_loader = _CachedDataLoader(_train)
+        val_loader = _CachedDataLoader(_val)
+        test_loader = _CachedDataLoader(_test)
+    else:
+        make_loader = partial(
+            DataLoader, batch_size=int(bs), **loader_kwargs
+        )
+        train_loader = make_loader(train_set, shuffle=True)
+        val_loader = make_loader(val_set, shuffle=False)
+        test_loader = make_loader(test_set, shuffle=False)
     return train_loader, val_loader, test_loader

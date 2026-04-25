@@ -64,6 +64,43 @@ Or explicitly specify a config:
 ./trainer.sh --config base
 ```
 
+#### Experiment Configs
+
+Place experiment-specific configs under `configs/experiments/` and inherit from `base`:
+
+```yaml
+# configs/experiments/my_exp.yaml
+defaults:
+  - base
+
+exp_name: my_experiment
+data:
+  seq_len: 128
+train:
+  learning_rate: 1.0e-3
+```
+
+Run it by name (the loader automatically falls back to `configs/experiments/`):
+
+```bash
+./trainer.sh --config my_exp
+```
+
+You can also use the full path:
+
+```bash
+./trainer.sh --config experiments/my_exp
+```
+
+#### Specify GPU(s)
+
+Set the `SOLVMIX_GPU` environment variable before running the script. This internally sets `CUDA_VISIBLE_DEVICES` so PyTorch only sees the selected GPU(s):
+
+```bash
+SOLVMIX_GPU=0 ./trainer.sh           # use GPU 0 only
+SOLVMIX_GPU=2,3 ./trainer.sh         # use GPUs 2 and 3
+```
+
 You can also run the trainer module directly (run from the repository root):
 
 ```bash
@@ -106,15 +143,17 @@ A helper script to keep GPUs under continuous load is included:
 
 ```
 SolvMix/
-├── callbacks/           # PyTorch Lightning callbacks (EMA, etc.)
+├── src/                 # Source code
+│   ├── callbacks/       # PyTorch Lightning callbacks (EMA, etc.)
+│   ├── dataset.py       # Dataset definition and SMILES processing
+│   ├── dataloader.py    # DataLoader and collate function
+│   └── model.py         # SolvMix GNN model
 ├── configs/             # OmegaConf configurations
 │   ├── data/            # Dataset configs (CALiSol, DiffMix, EDB-1, Bamboo-Mixer)
+│   ├── experiments/     # Experiment-specific configs inheriting from base
 │   ├── model/           # Model architecture configs
 │   └── train/           # Training hyperparameter configs
 ├── raw/                 # Raw dataset files and SMILES mappings
-├── dataset.py           # Dataset definition and SMILES processing
-├── dataloader.py        # DataLoader and collate function
-├── model.py             # SolvMix GNN model
 ├── trainer.py           # PyTorch Lightning training loop
 ├── trainer.sh           # Training launcher script
 ├── run_gpu.sh           # GPU stress test script

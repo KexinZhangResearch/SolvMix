@@ -1,4 +1,7 @@
+import bz2
+import gzip
 import json
+import lzma
 import os
 from collections import defaultdict
 from typing import Dict, List, Optional
@@ -15,9 +18,36 @@ from torch_geometric.data import Batch, Data
 # Path resolution (works regardless of cwd)
 # ---------------------------------------------------------------------------
 _MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
-_SMILES_MAPPING_PATH = os.path.join(_MODULE_DIR, "raw", "smiles_mapping.json")
+_PROJECT_DIR = os.path.dirname(_MODULE_DIR)
 
-with open(_SMILES_MAPPING_PATH, "r") as f:
+
+def _resolve_compressed_path(path: str) -> str:
+    """If the given path does not exist, try compressed variants (.xz, .gz, .bz2)."""
+    if os.path.exists(path):
+        return path
+    for ext in (".xz", ".gz", ".bz2"):
+        compressed = path + ext
+        if os.path.exists(compressed):
+            return compressed
+    return path
+
+
+def _open_json(path: str):
+    """Open a (possibly compressed) JSON file for reading text."""
+    if path.endswith(".xz"):
+        return lzma.open(path, "rt", encoding="utf-8")
+    if path.endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8")
+    if path.endswith(".bz2"):
+        return bz2.open(path, "rt", encoding="utf-8")
+    return open(path, "r", encoding="utf-8")
+
+
+_SMILES_MAPPING_PATH = _resolve_compressed_path(
+    os.path.join(_PROJECT_DIR, "raw", "smiles_mapping.json")
+)
+
+with _open_json(_SMILES_MAPPING_PATH) as f:
     smiles_mapping = json.load(f)
 
 solvent_smiles_map = smiles_mapping["solvents"]
@@ -171,16 +201,18 @@ class UnifiedDataset(Dataset):
     graph_amounts，避免在模型中通过顺序或 ratios 长度反推。
 
     支持通过 dataset_name 参数选择数据源。
+    处理后的数据会自动缓存到 processed/ 目录，相同分子图在不同样本间共享，
+    通过索引映射避免重复存储，显著降低内存占用并加快二次加载速度。
     """
 
     DATASET_PATHS = {
-        "bamboo_mixer": os.path.join(_MODULE_DIR, "raw", "Bamboo-Mixer_exp_data.json"),
-        "edb1": os.path.join(_MODULE_DIR, "raw", "EDB-1.json"),
-        "geomix_calisol": os.path.join(_MODULE_DIR, "raw", "GeoMix_CALiSol.json"),
-        "geomix_diffmix": os.path.join(_MODULE_DIR, "raw", "GeoMix_DiffMix.json"),
+        "bamboo_mixer": os.path.join(_PROJECT_DIR, "raw", "Bamboo-Mixer_exp_data.json"),
+        "edb1": os.path.join(_PROJECT_DIR, "raw", "EDB-1.json"),
+        "geomix_calisol": os.path.join(_PROJECT_DIR, "raw", "GeoMix_CALiSol.json"),
+        "geomix_diffmix": os.path.join(_PROJECT_DIR, "raw", "GeoMix_DiffMix.json"),
     }
 
-    def __init__(self, dataset_name, max_samples=1e8, device="cpu"):
+    def __init__(self, dataset_name, max_samples=1e8, device="cpu", force_reprocess=False):
         super().__init__()
         self.dataset_name = dataset_name
         self.max_samples = int(max_samples)
@@ -192,41 +224,104 @@ class UnifiedDataset(Dataset):
                 f"Unknown dataset_name '{dataset_name}'. "
                 f"Available: {list(self.DATASET_PATHS.keys())}"
             )
+        dataset_path = _resolve_compressed_path(dataset_path)
         if not os.path.exists(dataset_path):
             raise FileNotFoundError(f"Dataset file not found: {dataset_path}")
 
-        self.data = self._load_dataset(dataset_path)
-        self.data = self.data[: self.max_samples]
-        print(f"Dataset raw length: {len(self.data)}")
+        processed_dir = os.path.join(_PROJECT_DIR, "processed")
+        os.makedirs(processed_dir, exist_ok=True)
+        processed_path = os.path.join(processed_dir, f"{dataset_name}.pt")
+
+        need_process = force_reprocess or not os.path.exists(processed_path)
+        if not need_process and os.path.exists(dataset_path):
+            raw_mtime = os.path.getmtime(dataset_path)
+            proc_mtime = os.path.getmtime(processed_path)
+            if raw_mtime > proc_mtime:
+                need_process = True
+
+        if need_process:
+            self.process(dataset_path, processed_path)
+        else:
+            print(f"Loading processed dataset from {processed_path}")
+            cache = torch.load(processed_path, map_location="cpu")
+            self.unique_graphs = cache["unique_graphs"]
+            self.processed_data = cache["processed_data"]
+
+        self.processed_data = self.processed_data[: self.max_samples]
+        print(f"Dataset processed length: {len(self.processed_data)}")
+
+    def process(self, dataset_path, processed_path):
+        """
+        处理原始数据并缓存到 processed_path。
+        通过 unique_graphs 列表去重，processed_data 中只存储索引，
+        实现不同样本间相同分子图的高效共享。
+        """
+        raw_data = self._load_dataset(dataset_path)
+        print(f"Dataset raw length: {len(raw_data)}")
 
         # 预计算所有已知分子图
-        self._graph_cache = precompute_all_molecule_graphs()
-        # smiles -> name 反向映射，用于 name 为 null 时查找
-        self._smiles_to_name: Dict[str, str] = {}
+        graph_cache = precompute_all_molecule_graphs()
+        # smiles -> name 反向映射
+        smiles_to_name: Dict[str, str] = {}
         for name, smiles in solvent_smiles_map.items():
             if smiles:
-                self._smiles_to_name[smiles] = name
+                smiles_to_name[smiles] = name
         for name, smiles in salt_smiles_map.items():
             if smiles:
-                self._smiles_to_name[smiles] = name
-        # 动态缓存：遇到不在预计算 cache 中的 smiles 时实时生成
-        self._dynamic_cache: Dict[str, Optional[Data]] = {}
+                smiles_to_name[smiles] = name
 
-        # 在初始化时就把每个样本的图对象准备好
-        self.processed_data: List[Dict] = []
+        # 去重后的图列表和映射
+        unique_graphs: List[Data] = []
+        graph_key_to_idx: Dict[str, int] = {}
+
+        def _canonical_key(key: str) -> Optional[str]:
+            """返回用于去重的 canonical key（优先使用 name）。"""
+            if not key:
+                return None
+            if key in graph_cache:
+                return key
+            if key in smiles_to_name:
+                return smiles_to_name[key]
+            return key
+
+        def _get_or_add_graph(key: str) -> Optional[int]:
+            """获取或添加图，返回在 unique_graphs 中的索引。"""
+            canon = _canonical_key(key)
+            if canon is None:
+                return None
+            if canon in graph_key_to_idx:
+                return graph_key_to_idx[canon]
+
+            # 生成图对象
+            if key in graph_cache:
+                graph = graph_cache[key]
+            elif key in smiles_to_name:
+                graph = graph_cache.get(smiles_to_name[key])
+            else:
+                graph = smiles_to_pyg_data(key)
+
+            if graph is None:
+                return None
+
+            graph_key_to_idx[canon] = len(unique_graphs)
+            unique_graphs.append(graph)
+            return graph_key_to_idx[canon]
+
+        processed_data: List[Dict] = []
         dropped = 0
-        for item in self.data:
-            solvent_graphs = []
+        for item in raw_data:
+            solvent_indices = []
             for key in item["solvent_names"]:
-                g = self._get_graph(key)
-                if g is not None:
-                    solvent_graphs.append(g)
-            salt_graph = self._get_graph(item["salt"])
-            if not solvent_graphs or salt_graph is None:
+                idx = _get_or_add_graph(key)
+                if idx is not None:
+                    solvent_indices.append(idx)
+
+            salt_idx = _get_or_add_graph(item["salt"])
+            if not solvent_indices or salt_idx is None:
                 dropped += 1
                 continue
 
-            self.processed_data.append(
+            processed_data.append(
                 {
                     "y": item["y"],
                     "T": item["T"],
@@ -235,34 +330,29 @@ class UnifiedDataset(Dataset):
                     "salt_idx": _salt_to_idx.get(
                         item["salt_name"] if item["salt_name"] else item["salt"], -1
                     ),
-                    "solvent_graphs": solvent_graphs,
-                    "salt_graph": salt_graph,
+                    "solvent_graph_indices": solvent_indices,
+                    "salt_graph_idx": salt_idx,
                     "solvent_ratios": item["solvent_ratios"],
                 }
             )
+
         print(
-            f"Dataset processed length: {len(self.processed_data)} (dropped {dropped})"
+            f"Dataset processed length: {len(processed_data)} (dropped {dropped}), "
+            f"unique graphs: {len(unique_graphs)}"
         )
 
-    def _get_graph(self, key: str) -> Optional[Data]:
-        """根据 name 或 smiles 获取分子图。"""
-        if not key:
-            return None
-        # 1. 直接按 name 查找
-        if key in self._graph_cache:
-            return self._graph_cache[key]
-        # 2. 按 smiles 查找反向映射
-        if key in self._smiles_to_name:
-            name = self._smiles_to_name[key]
-            if name in self._graph_cache:
-                return self._graph_cache[name]
-        # 3. 尝试将 key 作为新 smiles 实时解析
-        if key not in self._dynamic_cache:
-            self._dynamic_cache[key] = smiles_to_pyg_data(key)
-        return self._dynamic_cache[key]
+        self.unique_graphs = unique_graphs
+        self.processed_data = processed_data
+
+        torch.save(
+            {"unique_graphs": unique_graphs, "processed_data": processed_data},
+            processed_path,
+        )
+        print(f"Saved processed dataset to {processed_path}")
 
     def _load_dataset(self, dataset_path):
-        with open(dataset_path, "r") as f:
+        dataset_path = _resolve_compressed_path(dataset_path)
+        with _open_json(dataset_path) as f:
             raw_data = json.load(f)
 
         data = []
@@ -324,4 +414,14 @@ class UnifiedDataset(Dataset):
         return len(self.processed_data)
 
     def __getitem__(self, idx):
-        return self.processed_data[idx]
+        item = self.processed_data[idx]
+        return {
+            "y": item["y"],
+            "T": item["T"],
+            "c": item["c"],
+            "salt": item["salt"],
+            "salt_idx": item["salt_idx"],
+            "solvent_graphs": [self.unique_graphs[i] for i in item["solvent_graph_indices"]],
+            "salt_graph": self.unique_graphs[item["salt_graph_idx"]],
+            "solvent_ratios": item["solvent_ratios"],
+        }

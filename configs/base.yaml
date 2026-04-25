@@ -6,8 +6,14 @@ defaults:
   - train: default
 
 # Experiment meta
-proj_name: SolvMix
-exp_name: SolvMix_v1
+proj_name: SolvMix_debug
+exp_name: base
 seed: 42
 test_only: false
 compile: false
+
+# Wandb API key (null means use global/env setting)
+wandb_api_key: null
+
+# Wandb offline mode (true = local only, false = sync to cloud)
+wandb_offline: false

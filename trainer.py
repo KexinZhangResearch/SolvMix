@@ -9,9 +9,9 @@ from omegaconf import OmegaConf
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 
-from .callbacks import EfficientEMACallback
-from .dataloader import build_dataloaders
-from .model import (
+from src.callbacks import EfficientEMACallback
+from src.dataloader import build_dataloaders
+from src.model import (
     SolvMix,
     make_regression_loss,
     regression_metrics,
@@ -24,8 +24,29 @@ _CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs"
 
 
 def load_config(config_name: str = "base"):
-    """Load a hierarchical OmegaConf config with defaults resolution."""
-    main_path = os.path.join(_CONFIG_DIR, f"{config_name}.yaml")
+    """Load a hierarchical OmegaConf config with defaults resolution.
+
+    Supports lookup modes:
+      - ``config_name``              -> configs/{config_name}.yaml
+      - fallback                     -> configs/experiments/{config_name}.yaml
+      - relative path with ``/``     -> resolved against project root
+    """
+    _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+    # Determine main_path
+    if "/" in config_name or "\\" in config_name:
+        main_path = os.path.join(_PROJECT_ROOT, config_name)
+        if not main_path.endswith(".yaml"):
+            main_path += ".yaml"
+    else:
+        name = config_name if config_name.endswith(".yaml") else f"{config_name}.yaml"
+        main_path = os.path.join(_CONFIG_DIR, name)
+        if not os.path.exists(main_path):
+            # Fallback to experiments/ directory
+            exp_path = os.path.join(_CONFIG_DIR, "experiments", name)
+            if os.path.exists(exp_path):
+                main_path = exp_path
+
     if not os.path.exists(main_path):
         raise FileNotFoundError(f"Config not found: {main_path}")
 
@@ -37,6 +58,11 @@ def load_config(config_name: str = "base"):
         defaults = cfg.pop("defaults")
         for item in defaults:
             if isinstance(item, dict) and "_self_" in item:
+                continue
+            # String default: inherit from another config file, e.g. - base
+            if isinstance(item, str) and item != "_self_":
+                sub_cfg = load_config(item)
+                merged = OmegaConf.merge(merged, sub_cfg)
                 continue
             # OmegaConf defaults item can be a DictConfig like {'data': 'edb1'}
             if hasattr(item, "keys") and len(item.keys()) == 1:
@@ -191,6 +217,17 @@ class ElectrolyteModuleSolvMix(pl.LightningModule):
         for name, value in regression_metrics(preds, targets).items():
             self.log(f"{stage}/{name}", value, sync_dist=True,
                      prog_bar=(name in {"r2", "mae", "rmse"}))
+        # Log histograms for test stage
+        if stage == "test" and hasattr(self, "logger") and self.logger is not None:
+            try:
+                import wandb as _wandb
+                _wandb.log({
+                    "test/pred_hist": _wandb.Histogram(preds.detach().cpu().numpy()),
+                    "test/target_hist": _wandb.Histogram(targets.detach().cpu().numpy()),
+                    "test/error_hist": _wandb.Histogram((preds - targets).detach().cpu().numpy()),
+                })
+            except Exception:
+                pass
         outputs.clear()
 
     def on_validation_epoch_end(self):
@@ -249,8 +286,18 @@ def main(cfg=None):
         parser = argparse.ArgumentParser()
         parser.add_argument("--config", type=str, default="base",
                             help="Config name under SolvMix/configs/ (without .yaml)")
+        parser.add_argument("--wandb_api_key", type=str, default=None,
+                            help="Optional wandb API key (overrides config and env var)")
         args = parser.parse_args()
         cfg = load_config(args.config)
+        # Priority: CLI > config > global env
+        if args.wandb_api_key:
+            os.environ["WANDB_API_KEY"] = args.wandb_api_key
+        elif getattr(cfg, "wandb_api_key", None):
+            os.environ["WANDB_API_KEY"] = cfg.wandb_api_key
+    else:
+        if getattr(cfg, "wandb_api_key", None):
+            os.environ["WANDB_API_KEY"] = cfg.wandb_api_key
 
     if cfg.data.num_workers > 0:
         import torch.multiprocessing as mp
@@ -304,6 +351,7 @@ def main(cfg=None):
         name=cfg.exp_name,
         save_dir=wandb_root,
         version=run_id,
+        offline=getattr(cfg, "wandb_offline", False),
     )
 
     trainer_kwargs = dict(

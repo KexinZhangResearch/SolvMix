@@ -1,6 +1,6 @@
 data:
   dataset_name: edb1
-  batch_size: 512
+  batch_size: null
   max_samples: 100000
   num_workers: 4
   seq_len: 16

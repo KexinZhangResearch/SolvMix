@@ -223,3 +223,6 @@ __marimo__/
 run_gpu*
 wandb/
 activate.sh
+processed/
+configs/experiments
+raw/*.json
