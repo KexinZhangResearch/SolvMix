@@ -252,11 +252,13 @@ class SolvMix(nn.Module):
         use_amount_scale=False,
         use_amount_and_type_emb=False,
         use_res_scale=False,
+        cond_mode="late_concat",
     ):
         super(SolvMix, self).__init__()
         self.seq_len = seq_len
         self.use_amount_scale = use_amount_scale
         self.use_amount_and_type_emb = use_amount_and_type_emb
+        self.cond_mode = cond_mode
 
         self.solvent_encoder = GNNEncoder(
             num_layer=num_gnn_blocks,
@@ -285,6 +287,9 @@ class SolvMix(nn.Module):
         )
 
         self.pool_proj = nn.Linear(hidden_dim, hidden_dim)
+
+        self.temp_token_mlp = MLP(2, hidden_dim, hidden_dim, num_layers=2, last_act="none")
+        self.conc_token_mlp = MLP(2, hidden_dim, hidden_dim, num_layers=2, last_act="none")
 
         if self.use_amount_and_type_emb:
             self.type_emb = nn.Embedding(2, hidden_dim)
@@ -422,13 +427,45 @@ class SolvMix(nn.Module):
                     g2b_indices * actual_seq_len + pos_idx)
 
         padding_mask = (h_graph_scattered.abs().sum(dim=-1) == 0)
-        h_sample = self.token_interaction_module(h_graph_scattered, key_padding_mask=padding_mask)
+        actual_seq_len = h_graph_scattered.size(1)
 
-        h_sample = h_sample.masked_fill(padding_mask.unsqueeze(-1), 0.0)
+        token_input = h_graph_scattered
+        token_padding_mask = padding_mask
+
+        if self.cond_mode == "in_context":
+            temp_feat = torch.stack([
+                T / 273.15,
+                273.15 / T.clamp_min(1e-8),
+            ], dim=-1)
+            conc_feat = torch.stack([
+                c,
+                torch.log1p(c.clamp_min(0)),
+            ], dim=-1)
+
+            temp_token = self.temp_token_mlp(temp_feat).unsqueeze(1)
+            conc_token = self.conc_token_mlp(conc_feat).unsqueeze(1)
+
+            cond_tokens = torch.cat([temp_token, conc_token], dim=1)
+            cond_mask = torch.zeros(
+                token_input.size(0),
+                2,
+                dtype=torch.bool,
+                device=token_input.device,
+            )
+
+            token_input = torch.cat([token_input, cond_tokens], dim=1)
+            token_padding_mask = torch.cat([token_padding_mask, cond_mask], dim=1)
+        elif self.cond_mode != "late_concat":
+            raise ValueError(f"Unknown cond_mode={self.cond_mode}")
+
+        h_all = self.token_interaction_module(token_input, key_padding_mask=token_padding_mask)
+
+        h_component = h_all[:, :actual_seq_len, :]
+        h_component = h_component.masked_fill(padding_mask.unsqueeze(-1), 0.0)
         valid_len = (~padding_mask).sum(dim=1, keepdim=True)
-        h_sample = h_sample.sum(dim=1) / valid_len.clamp(min=1)
+        h_sample = h_component.sum(dim=1) / valid_len.clamp(min=1)
 
-        feature_all = torch.cat([self.pool_proj(h_sample), T.unsqueeze(1) / 273.15, (273.15 / T).unsqueeze(1)], dim=1)
+        feature_all = torch.cat([self.pool_proj(h_sample), T.unsqueeze(1) / 273.15, (273.15 / T.clamp_min(1e-8)).unsqueeze(1)], dim=1)
 
         res = self.readout(feature_all).squeeze(1)
 

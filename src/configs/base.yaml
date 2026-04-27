@@ -39,6 +39,9 @@ model:
   # Learnable residual scale for GNN blocks
   use_res_scale: false
 
+  # Condition mode: late_concat (default) or in_context
+  cond_mode: late_concat
+
 # Training
 train:
   epochs: 35000

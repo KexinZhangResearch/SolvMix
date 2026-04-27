@@ -36,6 +36,7 @@ class SolvMixWrapper(pl.LightningModule):
             use_amount_scale=m_cfg.use_amount_scale,
             use_amount_and_type_emb=m_cfg.use_amount_and_type_emb,
             use_res_scale=m_cfg.use_res_scale,
+            cond_mode=getattr(m_cfg, "cond_mode", "late_concat"),
         )
         self.loss_fn = torch.nn.MSELoss()
         self.mae_fn = torch.nn.L1Loss()
