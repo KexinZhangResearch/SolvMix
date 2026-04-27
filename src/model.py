@@ -99,6 +99,22 @@ class Transformer(nn.Module):
         return x
 
 
+class TokenInteractionModule(nn.Module):
+    def __init__(
+        self,
+        dim,
+        num_layer=4,
+        num_heads=8,
+    ):
+        super().__init__()
+        self.blocks = nn.ModuleList([TransformerBlock(dim, num_heads) for _ in range(num_layer)])
+
+    def forward(self, x, key_padding_mask=None):
+        for block in self.blocks:
+            x = block(x, key_padding_mask=key_padding_mask)
+        return x
+
+
 # ================== BaseMLP_2 ==================
 class BaseMLP_2(nn.Module):
     def __init__(
@@ -151,11 +167,15 @@ class BaseMLP_2(nn.Module):
 
 # ================== GNN ==================
 class GNNEncoderBlock(nn.Module):
-    def __init__(self, edge_attr_dim, hidden_dim):
+    def __init__(self, edge_attr_dim, hidden_dim, use_res_scale=False):
         super().__init__()
-        self.mlp_msg = MLP(2 * hidden_dim + edge_attr_dim, hidden_dim, hidden_dim, last_act="silu")
+        self.mlp_msg = MLP(2 * hidden_dim + edge_attr_dim, hidden_dim, hidden_dim, last_act="none")
         self.mlp_node = MLP(2 * hidden_dim, hidden_dim, hidden_dim, last_act="none")
         self.norm = nn.LayerNorm(hidden_dim)
+        if use_res_scale:
+            self.res_scale = nn.Parameter(torch.zeros(1))
+        else:
+            self.res_scale = 1.
 
     def forward(self, h, edge_index, edge_attr):
         row, col = edge_index
@@ -165,15 +185,16 @@ class GNNEncoderBlock(nn.Module):
         msg = self.mlp_msg(msg)
         msg_agg = scatter(msg, row, dim=0, dim_size=h.size(0), reduce='mean')
         h_new = self.mlp_node(torch.cat([h, msg_agg], dim=-1))
-        h = self.norm(h + h_new)
+        h = self.norm(h + self.res_scale * h_new)
         return h
 
 
 class GNNEncoder(nn.Module):
-    def __init__(self, num_layer, node_input_dim, edge_attr_dim, hidden_dim):
+    def __init__(self, num_layer, node_input_dim, edge_attr_dim, hidden_dim, use_res_scale=False):
         super().__init__()
         self.embedding = nn.Linear(node_input_dim, hidden_dim)
-        self.layers = nn.ModuleList([GNNEncoderBlock(edge_attr_dim, hidden_dim) for _ in range(num_layer)])
+        self.layers = nn.ModuleList([GNNEncoderBlock(edge_attr_dim, hidden_dim, use_res_scale)
+                                    for _ in range(num_layer)])
 
     def forward(self, h, edge_index, edge_attr):
         h = self.embedding(h)
@@ -183,11 +204,15 @@ class GNNEncoder(nn.Module):
 
 
 class AtomInteractionGNNBlock(nn.Module):
-    def __init__(self, hidden_dim, activation=None):
+    def __init__(self, hidden_dim, use_res_scale=False):
         super().__init__()
-        self.mlp_msg = MLP(2 * hidden_dim, hidden_dim, hidden_dim, last_act="silu")
+        self.mlp_msg = MLP(2 * hidden_dim, hidden_dim, hidden_dim, last_act="none")
         self.mlp_upd = MLP(2 * hidden_dim, hidden_dim, hidden_dim, last_act="none")
         self.norm = nn.LayerNorm(hidden_dim)
+        if use_res_scale:
+            self.res_scale = nn.Parameter(torch.zeros(1))
+        else:
+            self.res_scale = 1.
 
     def forward(self, h, inter_edge_index):
         row, col = inter_edge_index
@@ -195,14 +220,14 @@ class AtomInteractionGNNBlock(nn.Module):
         msg = self.mlp_msg(msg)
         agg = scatter(msg, row, dim=0, dim_size=h.size(0), reduce='mean')
         h_new = self.mlp_upd(torch.cat([h, agg], dim=-1))
-        h = self.norm(h + h_new)
+        h = self.norm(h + self.res_scale * h_new)
         return h
 
 
 class AtomInteractionModule(nn.Module):
-    def __init__(self, hidden_dim, num_layer):
+    def __init__(self, hidden_dim, num_layer, use_res_scale=False):
         super().__init__()
-        self.layers = nn.ModuleList([AtomInteractionGNNBlock(hidden_dim) for _ in range(num_layer)])
+        self.layers = nn.ModuleList([AtomInteractionGNNBlock(hidden_dim, use_res_scale) for _ in range(num_layer)])
 
     def forward(self, h, inter_edge_index):
         for layer in self.layers:
@@ -224,38 +249,51 @@ class SolvMix(nn.Module):
         num_atom_blocks=0,
         seq_len=16,
         device='cpu',
-        if_c_gate=False,
+        use_amount_scale=False,
+        use_amount_and_type_emb=False,
+        use_res_scale=False,
     ):
         super(SolvMix, self).__init__()
         self.seq_len = seq_len
-        self.if_c_gate = if_c_gate
+        self.use_amount_scale = use_amount_scale
+        self.use_amount_and_type_emb = use_amount_and_type_emb
 
         self.solvent_encoder = GNNEncoder(
             num_layer=num_gnn_blocks,
             node_input_dim=node_input_dim,
             edge_attr_dim=edge_attr_dim,
             hidden_dim=hidden_dim,
+            use_res_scale=use_res_scale,
         )
         self.salt_encoder = GNNEncoder(
             num_layer=num_gnn_blocks,
             node_input_dim=node_input_dim,
             edge_attr_dim=edge_attr_dim,
             hidden_dim=hidden_dim,
+            use_res_scale=use_res_scale,
         )
 
-        self.atom_interaction_module = AtomInteractionModule(hidden_dim, num_atom_blocks)
+        if num_atom_blocks > 0:
+            self.atom_interaction_module = AtomInteractionModule(hidden_dim, num_atom_blocks, use_res_scale)
+        else:
+            self.atom_interaction_module = None
 
-        self.att = Transformer(
-            hidden_dim,
-            hidden_dim,
+        self.token_interaction_module = TokenInteractionModule(
             hidden_dim,
             num_layer=num_token_blocks,
             num_heads=num_atten_head,
         )
 
-        if self.if_c_gate:
-            self.solvent_gate_mlp = MLP(1, hidden_dim, hidden_dim, last_act="sigmoid")
-            self.salt_gate_mlp = MLP(1, hidden_dim, hidden_dim, last_act="sigmoid")
+        self.pool_proj = nn.Linear(hidden_dim, hidden_dim)
+
+        if self.use_amount_and_type_emb:
+            self.type_emb = nn.Embedding(2, hidden_dim)
+            self.solvent_amount_emb = MLP(1, hidden_dim, hidden_dim, last_act="none")
+            self.salt_amount_emb = MLP(1, hidden_dim, hidden_dim, last_act="none")
+
+        if self.use_amount_scale:
+            self.solvent_gate_mlp = MLP(1, hidden_dim, hidden_dim, last_act="none")
+            self.salt_gate_mlp = MLP(1, hidden_dim, hidden_dim, last_act="none")
 
         self.readout = nn.Sequential(
             BaseMLP_2(hidden_dim + 2, hidden_dim + 2, hidden_dim + 2,
@@ -289,6 +327,7 @@ class SolvMix(nn.Module):
         ratios=None,
         pos_idx=None,
         seq_len=None,
+        num_solvent_graphs=None,
     ):
         if self._cache_enabled:
             key = self._make_cache_key(n2g_indices, n2b_indices)
@@ -309,20 +348,40 @@ class SolvMix(nn.Module):
             if cache is not None:
                 cache['inter_edge_index'] = inter_edge_index
 
-        h_atom = self.atom_interaction_module(h_atom, inter_edge_index)
+        if self.atom_interaction_module is not None:
+            h_atom = self.atom_interaction_module(h_atom, inter_edge_index)
 
         h_graph = scatter_mean(h_atom, n2g_indices, dim=0)
 
-        if self.if_c_gate:
+        if self.use_amount_and_type_emb:
+            _n_solv = num_solvent_graphs if num_solvent_graphs is not None else (ratios.shape[0] if ratios is not None else 0)
+            # type embedding
+            token_types = torch.zeros(h_graph.size(0), dtype=torch.long, device=h_graph.device)
+            if _n_solv < h_graph.size(0):
+                token_types[_n_solv:] = 1
+            h_graph = h_graph + self.type_emb(token_types)
+            # solvent amount embedding
+            if _n_solv > 0:
+                solvent_amount = self.solvent_amount_emb(ratios.unsqueeze(-1))
+                h_graph[:_n_solv] = h_graph[:_n_solv] + solvent_amount
+            # salt amount embedding
+            _n_salt = h_graph.size(0) - _n_solv
+            if _n_salt > 0:
+                salt_g2b = g2b_indices[_n_solv:]
+                salt_c = c[salt_g2b].unsqueeze(-1)
+                salt_amount = self.salt_amount_emb(salt_c)
+                h_graph[_n_solv:] = h_graph[_n_solv:] + salt_amount
+
+        if self.use_amount_scale:
             if cache is not None and 'num_solvent_graphs' in cache:
-                num_solvent_graphs = cache['num_solvent_graphs']
+                _n_solv = cache['num_solvent_graphs']
             else:
-                num_solvent_graphs = ratios.shape[0] if ratios is not None else 0
+                _n_solv = num_solvent_graphs if num_solvent_graphs is not None else (ratios.shape[0] if ratios is not None else 0)
                 if cache is not None:
-                    cache['num_solvent_graphs'] = num_solvent_graphs
+                    cache['num_solvent_graphs'] = _n_solv
 
             gated_parts = []
-            if num_solvent_graphs > 0:
+            if _n_solv > 0:
                 if cache is not None and 'solvent_ratios_for_gate' in cache:
                     solvent_ratios_for_gate = cache['solvent_ratios_for_gate']
                 else:
@@ -330,7 +389,7 @@ class SolvMix(nn.Module):
                     if cache is not None:
                         cache['solvent_ratios_for_gate'] = solvent_ratios_for_gate
                 solvent_gate = self.solvent_gate_mlp(solvent_ratios_for_gate)
-                gated_parts.append(h_graph[:num_solvent_graphs] * solvent_gate)
+                gated_parts.append(h_graph[:_n_solv] * solvent_gate)
 
             if cache is not None and 'salt_c_for_gate' in cache:
                 salt_c_for_gate = cache['salt_c_for_gate']
@@ -339,7 +398,7 @@ class SolvMix(nn.Module):
                 if cache is not None:
                     cache['salt_c_for_gate'] = salt_c_for_gate
             salt_gate = self.salt_gate_mlp(salt_c_for_gate)
-            gated_parts.append(h_graph[num_solvent_graphs:] * salt_gate)
+            gated_parts.append(h_graph[_n_solv:] * salt_gate)
 
             h_graph = torch.cat(gated_parts, dim=0)
 
@@ -363,9 +422,13 @@ class SolvMix(nn.Module):
                     g2b_indices * actual_seq_len + pos_idx)
 
         padding_mask = (h_graph_scattered.abs().sum(dim=-1) == 0)
-        h_sample = self.att(h_graph_scattered, key_padding_mask=padding_mask)
+        h_sample = self.token_interaction_module(h_graph_scattered, key_padding_mask=padding_mask)
 
-        feature_all = torch.cat([h_sample, T.unsqueeze(1) / 273.15, (273.15 / T).unsqueeze(1)], dim=1)
+        h_sample = h_sample.masked_fill(padding_mask.unsqueeze(-1), 0.0)
+        valid_len = (~padding_mask).sum(dim=1, keepdim=True)
+        h_sample = h_sample.sum(dim=1) / valid_len.clamp(min=1)
+
+        feature_all = torch.cat([self.pool_proj(h_sample), T.unsqueeze(1) / 273.15, (273.15 / T).unsqueeze(1)], dim=1)
 
         res = self.readout(feature_all).squeeze(1)
 

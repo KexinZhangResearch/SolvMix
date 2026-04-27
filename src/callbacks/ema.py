@@ -13,6 +13,8 @@ class EfficientEMACallback(pl.Callback):
     1. 追踪 named_parameters() + floating point buffers（含 BN running stats），
        保证 validation/test 时参数与统计量完全匹配，避免损失波动。
     2. update / swap / restore 均使用原地操作（mul_ / add_ / copy_），避免大量临时张量。
+    3. 在 optimizer.step() 之后更新 EMA，天然兼容 gradient accumulation。
+    4. resume 训练时不会覆盖已加载的 EMA 状态。
     """
 
     def __init__(self, decay=0.999):
@@ -22,21 +24,37 @@ class EfficientEMACallback(pl.Callback):
         self.ema_buffers = {}
         self._backup_params = {}
         self._backup_buffers = {}
+        self._model_training_state = True
 
     def on_fit_start(self, trainer, pl_module):
-        self.ema_params = {
-            name: param.detach().clone()
-            for name, param in pl_module.model.named_parameters()
-            if param.requires_grad
-        }
-        # 同步追踪 floating point buffers（如 BN running_mean / running_var）
-        self.ema_buffers = {
-            name: buffer.detach().clone()
-            for name, buffer in pl_module.model.named_buffers()
-            if torch.is_floating_point(buffer)
-        }
+        # 只在首次训练时初始化；resume 时若已加载 checkpoint["ema"] 则跳过，避免覆盖
+        if not self.ema_params:
+            self.ema_params = {
+                name: param.detach().clone()
+                for name, param in pl_module.model.named_parameters()
+                if param.requires_grad
+            }
+        if not self.ema_buffers:
+            self.ema_buffers = {
+                name: buffer.detach().clone()
+                for name, buffer in pl_module.model.named_buffers()
+                if torch.is_floating_point(buffer)
+            }
+        # 确保设备一致（resume 后模型可能被移到不同 device）
+        device = next(pl_module.model.parameters()).device
+        for k in self.ema_params:
+            if isinstance(self.ema_params[k], torch.Tensor) and self.ema_params[k].device != device:
+                self.ema_params[k] = self.ema_params[k].to(device)
+        for k in self.ema_buffers:
+            if isinstance(self.ema_buffers[k], torch.Tensor) and self.ema_buffers[k].device != device:
+                self.ema_buffers[k] = self.ema_buffers[k].to(device)
 
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+    def on_before_zero_grad(self, trainer, pl_module, optimizer):
+        """
+        在 optimizer.step() 之后、zero_grad 之前更新 EMA。
+        相比 on_train_batch_end，这里保证只在参数真正被 optimizer 更新后才平滑，
+        天然兼容 gradient accumulation。
+        """
         with torch.no_grad():
             decay = self.decay
             one_minus_decay = 1.0 - decay
@@ -106,20 +124,28 @@ class EfficientEMACallback(pl.Callback):
         self._backup_buffers = {}
 
     def on_validation_epoch_start(self, trainer, pl_module):
+        self._model_training_state = pl_module.model.training
         self._swap_to_ema(pl_module)
         pl_module.model.eval()
 
     def on_validation_epoch_end(self, trainer, pl_module):
         self._restore_backup(pl_module)
-        pl_module.model.train()
+        if self._model_training_state:
+            pl_module.model.train()
+        else:
+            pl_module.model.eval()
 
     def on_test_epoch_start(self, trainer, pl_module):
+        self._model_training_state = pl_module.model.training
         self._swap_to_ema(pl_module)
         pl_module.model.eval()
 
     def on_test_epoch_end(self, trainer, pl_module):
         self._restore_backup(pl_module)
-        pl_module.model.eval()
+        if self._model_training_state:
+            pl_module.model.train()
+        else:
+            pl_module.model.eval()
 
     def on_save_checkpoint(self, trainer, pl_module, checkpoint):
         checkpoint["ema"] = {"params": self.ema_params, "buffers": self.ema_buffers}

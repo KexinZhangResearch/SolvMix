@@ -3,7 +3,8 @@
 exp_name: DEBUG
 
 model:
-  if_c_gate: true
+  use_amount_scale: true
+  use_amount_and_type_emb: true
 
 train:
   epochs: 20000

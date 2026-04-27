@@ -4,7 +4,6 @@ import os
 import hydra
 import pytorch_lightning as pl
 import torch
-import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
@@ -16,8 +15,6 @@ from src.model import SolvMix
 
 
 # ================== Lightning module ==================
-
-
 class SolvMixWrapper(pl.LightningModule):
     def __init__(self, cfg):
         super().__init__()
@@ -36,7 +33,9 @@ class SolvMixWrapper(pl.LightningModule):
             num_atom_blocks=m_cfg.num_atom_blocks,
             seq_len=cfg.data.seq_len,
             device="cpu",
-            if_c_gate=m_cfg.if_c_gate,
+            use_amount_scale=m_cfg.use_amount_scale,
+            use_amount_and_type_emb=m_cfg.use_amount_and_type_emb,
+            use_res_scale=m_cfg.use_res_scale,
         )
         self.loss_fn = torch.nn.MSELoss()
         self.mae_fn = torch.nn.L1Loss()
@@ -52,9 +51,10 @@ class SolvMixWrapper(pl.LightningModule):
             batch["g2b_indices"],
             batch["T"],
             batch["c"],
-            batch.get("ratios"),
+            batch["ratios"],
             batch.get("pos_idx"),
             batch.get("seq_len"),
+            batch.get("num_solvent_graphs"),
         )
 
     def training_step(self, batch, batch_idx):
@@ -62,9 +62,8 @@ class SolvMixWrapper(pl.LightningModule):
         log_target = torch.log1p(batch["y"])
         loss = self.loss_fn(log_pred, log_target)
         self.log("train/loss", loss, prog_bar=True, batch_size=batch["y"].size(0))
-        if self.trainer.optimizers:
-            lr = self.trainer.optimizers[0].param_groups[0]["lr"]
-            self.log("lr", lr, prog_bar=False, batch_size=batch["y"].size(0))
+        lr = self.trainer.optimizers[0].param_groups[0]["lr"]
+        self.log("lr", lr, prog_bar=False)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -97,7 +96,6 @@ class SolvMixWrapper(pl.LightningModule):
             targets = torch.cat([x["target"] for x in self.test_step_outputs])
             for name, value in regression_metrics(preds, targets).items():
                 self.log(f"test/{name}", value, sync_dist=True)
-            # Log histograms
             if hasattr(self, "logger") and self.logger is not None:
                 try:
                     import wandb as _wandb
@@ -117,7 +115,7 @@ class SolvMixWrapper(pl.LightningModule):
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
                 continue
-            if "norm" in name.lower() or name.endswith("bias"):
+            if "norm" in name.lower() or "layer_norm" in name.lower():
                 no_decay_params.append(param)
             else:
                 decay_params.append(param)
@@ -148,7 +146,6 @@ class SolvMixWrapper(pl.LightningModule):
 
 
 # ================== Runner ==================
-# Resolve config dir relative to this script so it works regardless of cwd
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _CONFIG_PATH = os.path.join(_SCRIPT_DIR, "src", "configs")
 
@@ -191,7 +188,6 @@ def main(cfg: DictConfig) -> None:
     if t_cfg.use_ema:
         callbacks.append(EfficientEMACallback(decay=t_cfg.ema_decay))
 
-    _solv_mix_root = os.path.dirname(os.path.abspath(__file__))
     wandb_root = os.path.join(_solv_mix_root, "wandb")
     os.makedirs(wandb_root, exist_ok=True)
 

@@ -1,11 +1,12 @@
-# SolvMix GeoMix v5 base configuration
+# SolvMix v5-style base configuration
+
 defaults:
   - _self_
   - optional experiments: null
 
 # Experiment meta
 proj_name: SolvMix_Electrolyte
-exp_name: geomix_v5
+exp_name: solvmix_min_amount_scale
 seed: 42
 test_only: false
 compile: false
@@ -15,7 +16,7 @@ data:
   dataset_name: GeoMix_CALiSol
   batch_size: null
   max_samples: 100000
-  num_workers: 0
+  num_workers: 8
   seq_len: 16
   train_ratio: 0.7
   val_ratio: 0.2
@@ -24,11 +25,19 @@ data:
 model:
   hidden_dim: 64
   num_gnn_blocks: 3
-  num_atom_blocks: 3
+  num_atom_blocks: 0
   num_mlp_layer: 3
   num_token_blocks: 3
   num_atten_head: 4
-  if_c_gate: true
+
+  # Concentration gate: unbounded amount-conditioned scale
+  use_amount_scale: false
+
+  # Adds type embedding + separate solvent/salt amount embeddings before scatter
+  use_amount_and_type_emb: false
+
+  # Learnable residual scale for GNN blocks
+  use_res_scale: false
 
 # Training
 train:
@@ -42,9 +51,9 @@ train:
 
   devices: 1
   precision: "32"
-  test_interval: 5
+  test_interval: 10
 
-  use_ema: false
+  use_ema: true
   ema_decay: 0.999
 
 # Wandb

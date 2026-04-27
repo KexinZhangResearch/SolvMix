@@ -376,6 +376,8 @@ def solv_mix_collate_fn_optimized(batch, device='cpu', seq_len=8):
     pos_idx[sorted_idx] = sorted_pos_within_group
     pos_idx = pos_idx.clamp(max=seq_len - 1)
 
+    num_solvent_graphs = len(all_solvent_graphs)
+
     return {
         'y': y_values.to(device, non_blocking=True),
         'T': T_values.to(device, non_blocking=True),
@@ -389,4 +391,5 @@ def solv_mix_collate_fn_optimized(batch, device='cpu', seq_len=8):
         'ratios': batch_ratios.to(device, non_blocking=True),
         'pos_idx': pos_idx.to(device),
         'seq_len': seq_len,
+        'num_solvent_graphs': num_solvent_graphs,
     }
