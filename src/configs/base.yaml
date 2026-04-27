@@ -1,0 +1,56 @@
+# SolvMix GeoMix v5 base configuration
+defaults:
+  - _self_
+  - optional experiments: null
+
+# Experiment meta
+proj_name: SolvMix_Electrolyte
+exp_name: geomix_v5
+seed: 42
+test_only: false
+compile: false
+
+# Data
+data:
+  dataset_name: GeoMix_CALiSol
+  batch_size: null
+  max_samples: 100000
+  num_workers: 0
+  seq_len: 16
+  train_ratio: 0.7
+  val_ratio: 0.2
+
+# Model
+model:
+  hidden_dim: 64
+  num_gnn_blocks: 3
+  num_atom_blocks: 3
+  num_mlp_layer: 3
+  num_token_blocks: 3
+  num_atten_head: 4
+  if_c_gate: true
+
+# Training
+train:
+  epochs: 35000
+  learning_rate: 3.0e-4
+  weight_decay: 1.0e-4
+  optimizer: AdamW
+  warmup_steps: 100
+  lr_gamma: 0.99985
+  grad_clip_val: 0.5
+
+  devices: 1
+  precision: "32"
+  test_interval: 5
+
+  use_ema: false
+  ema_decay: 0.999
+
+# Wandb
+wandb_api_key: null
+wandb_offline: false
+
+hydra:
+  job:
+    chdir: false

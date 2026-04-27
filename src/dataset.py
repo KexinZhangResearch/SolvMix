@@ -1,12 +1,10 @@
-import bz2
 import gzip
 import json
 import lzma
 import os
-from collections import defaultdict
-from typing import Dict, List, Optional
+import pickle
+from typing import Dict, Optional
 
-import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
@@ -15,72 +13,30 @@ from torch.utils.data import Dataset
 from torch_geometric.data import Batch, Data
 
 # ---------------------------------------------------------------------------
-# Path resolution (works regardless of cwd)
+# Path resolution
 # ---------------------------------------------------------------------------
 _MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_DIR = os.path.dirname(_MODULE_DIR)
+RAW_DIR = os.path.join(_PROJECT_DIR, "raw")
+PROCESSED_DIR = os.path.join(_PROJECT_DIR, "processed")
+os.makedirs(PROCESSED_DIR, exist_ok=True)
 
 
-def _resolve_compressed_path(path: str) -> str:
-    """If the given path does not exist, try compressed variants (.xz, .gz, .bz2)."""
-    if os.path.exists(path):
-        return path
-    for ext in (".xz", ".gz", ".bz2"):
-        compressed = path + ext
-        if os.path.exists(compressed):
-            return compressed
-    return path
-
-
-def _open_json(path: str):
-    """Open a (possibly compressed) JSON file for reading text."""
-    if path.endswith(".xz"):
-        return lzma.open(path, "rt", encoding="utf-8")
-    if path.endswith(".gz"):
-        return gzip.open(path, "rt", encoding="utf-8")
-    if path.endswith(".bz2"):
-        return bz2.open(path, "rt", encoding="utf-8")
-    return open(path, "r", encoding="utf-8")
-
-
-_SMILES_MAPPING_PATH = _resolve_compressed_path(
-    os.path.join(_PROJECT_DIR, "raw", "smiles_mapping.json")
-)
-
-with _open_json(_SMILES_MAPPING_PATH) as f:
-    smiles_mapping = json.load(f)
-
-solvent_smiles_map = smiles_mapping["solvents"]
-salt_smiles_map = smiles_mapping["salts"]
-
+# ---------------------------------------------------------------------------
+# Salt vocabulary
+# ---------------------------------------------------------------------------
 salt_list = [
-    "LiPF6",
-    "LiBF4",
-    "LiFSI",
-    "LiTDI",
-    "LiPDI",
-    "LiTFSI",
-    "LiClO4",
-    "LiAsF6",
-    "LiBOB",
-    "LiCF3SO3",
-    "LiBPFPB",
-    "LiBMB",
-    "LiN(CF3SO2)2",
-    "LiCTFSI",
-    "LiDFOB",
-    "LiFSA",
-    "LiFNFSI",
+    'LiPF6', 'LiBF4', 'LiFSI', 'LiTDI', 'LiPDI', 'LiTFSI',
+    'LiClO4', 'LiAsF6', 'LiBOB', 'LiCF3SO3', 'LiBPFPB', 'LiBMB', 'LiN(CF3SO2)2'
 ]
+
 _salt_to_idx = {name: i for i, name in enumerate(salt_list)}
 
-# ---------------------------------------------------------------------------
-# Atom / bond features
-# ---------------------------------------------------------------------------
 
-
+# ---------------------------------------------------------------------------
+# RDKit graph featurization
+# ---------------------------------------------------------------------------
 def get_atom_features_onehot(atom):
-    """Generate 152-dim one-hot atom features."""
     atomic_num = atom.GetAtomicNum()
     atomic_num_onehot = F.one_hot(torch.tensor(atomic_num), num_classes=119).float()
     degree = atom.GetDegree()
@@ -100,22 +56,13 @@ def get_atom_features_onehot(atom):
     hyb_onehot = F.one_hot(torch.tensor(hyb_idx), num_classes=5).float()
     ring = int(atom.IsInRing())
     ring_onehot = F.one_hot(torch.tensor(ring), num_classes=2).float()
-    return torch.cat(
-        [
-            atomic_num_onehot,
-            degree_onehot,
-            h_onehot,
-            valence_onehot,
-            charge_onehot,
-            aromatic_onehot,
-            hyb_onehot,
-            ring_onehot,
-        ]
-    )
+    return torch.cat([
+        atomic_num_onehot, degree_onehot, h_onehot, valence_onehot,
+        charge_onehot, aromatic_onehot, hyb_onehot, ring_onehot
+    ])
 
 
 def smiles_to_pyg_data(smiles: str) -> Optional[Data]:
-    """Convert SMILES to PyG Data with 152-dim node features and 13-dim edge features."""
     if not smiles or pd.isna(smiles):
         return None
     mol = Chem.MolFromSmiles(smiles)
@@ -137,27 +84,18 @@ def smiles_to_pyg_data(smiles: str) -> Optional[Data]:
         bond_type_idx = bond_type_map.get(bond_type, 0)
         bond_type_onehot = F.one_hot(torch.tensor(bond_type_idx), num_classes=4).float()
         stereo = bond.GetStereo()
-        stereo_map = {
-            "STEREONONE": 0,
-            "STEREOANY": 1,
-            "STEREOCIS": 2,
-            "STEREOTRANS": 3,
-            "STEREOE": 4,
-            "STEREOZ": 5,
-        }
-        stereo_name = str(stereo).split(".")[-1] if "." in str(stereo) else str(stereo)
+        stereo_map = {'STEREONONE': 0, 'STEREOANY': 1, 'STEREOCIS': 2,
+                      'STEREOTRANS': 3, 'STEREOE': 4, 'STEREOZ': 5}
+        stereo_name = str(stereo).split('.')[-1] if '.' in str(stereo) else str(stereo)
         stereo_idx = stereo_map.get(stereo_name, 0)
         stereo_onehot = F.one_hot(torch.tensor(stereo_idx), num_classes=6).float()
         is_conjugated = int(bond.GetIsConjugated())
         is_aromatic = int(bond.GetIsAromatic())
         is_in_ring = int(bond.IsInRing())
-        edge_feat = torch.cat(
-            [
-                bond_type_onehot,
-                stereo_onehot,
-                torch.tensor([is_conjugated, is_aromatic, is_in_ring], dtype=torch.float),
-            ]
-        )
+        edge_feat = torch.cat([
+            bond_type_onehot, stereo_onehot,
+            torch.tensor([is_conjugated, is_aromatic, is_in_ring], dtype=torch.float)
+        ])
         edge_index.extend([[i, j], [j, i]])
         edge_attr.extend([edge_feat, edge_feat])
 
@@ -171,8 +109,7 @@ def smiles_to_pyg_data(smiles: str) -> Optional[Data]:
     return Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
 
 
-def precompute_all_molecule_graphs() -> Dict[str, Data]:
-    """Precompute molecular graphs for all known solvents and salts from smiles_mapping."""
+def precompute_all_molecule_graphs(solvent_smiles_map: Dict[str, str], salt_smiles_map: Dict[str, str]) -> Dict[str, Data]:
     all_graphs: Dict[str, Data] = {}
     for name, smiles in solvent_smiles_map.items():
         if smiles:
@@ -188,240 +125,268 @@ def precompute_all_molecule_graphs() -> Dict[str, Data]:
 
 
 # ---------------------------------------------------------------------------
-# Unified Dataset
+# Compressed JSON helper
 # ---------------------------------------------------------------------------
+def _resolve_data_path(name: str) -> str:
+    base = os.path.join(RAW_DIR, name)
+    if os.path.exists(base):
+        return base
+    # Try compressed variants
+    for ext in (".xz", ".gz", ".bz2"):
+        compressed = base + ext
+        if os.path.exists(compressed):
+            return compressed
+    # Try .json + compression (e.g. GeoMix_CALiSol.json.xz)
+    if not name.endswith(".json"):
+        json_base = os.path.join(RAW_DIR, name + ".json")
+        if os.path.exists(json_base):
+            return json_base
+        for ext in (".xz", ".gz", ".bz2"):
+            compressed = json_base + ext
+            if os.path.exists(compressed):
+                return compressed
+    return base
 
 
-class UnifiedDataset(Dataset):
-    """
-    读取 raw/ 下统一格式的 JSON 数据集。
+def _open_json(path: str):
+    if path.endswith(".xz"):
+        return lzma.open(path, "rt", encoding="utf-8")
+    if path.endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8")
+    return open(path, "r", encoding="utf-8")
 
-    溶剂组分使用 solvent mol ratio；盐使用 salt concentration / mol_ratio。
-    两者物理单位和语义不同，collate_fn 会显式返回 graph_types 与
-    graph_amounts，避免在模型中通过顺序或 ratios 长度反推。
 
-    支持通过 dataset_name 参数选择数据源。
-    处理后的数据会自动缓存到 processed/ 目录，相同分子图在不同样本间共享，
-    通过索引映射避免重复存储，显著降低内存占用并加快二次加载速度。
-    """
-
-    DATASET_PATHS = {
-        "bamboo_mixer": os.path.join(_PROJECT_DIR, "raw", "Bamboo-Mixer_exp_data.json"),
-        "edb1": os.path.join(_PROJECT_DIR, "raw", "EDB-1.json"),
-        "geomix_calisol": os.path.join(_PROJECT_DIR, "raw", "GeoMix_CALiSol.json"),
-        "geomix_diffmix": os.path.join(_PROJECT_DIR, "raw", "GeoMix_DiffMix.json"),
-    }
-
-    def __init__(self, dataset_name, max_samples=1e8, device="cpu", force_reprocess=False):
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+class RDKit2DConductivityDatasetOptimized(Dataset):
+    def __init__(self, dataset_name: str = "GeoMix_CALiSol", max_samples: int = 100_000, device: str = "cpu"):
         super().__init__()
         self.dataset_name = dataset_name
         self.max_samples = int(max_samples)
         self.device = device
+        self.raw_data = self.load_dataset()
 
-        dataset_path = self.DATASET_PATHS.get(dataset_name)
-        if dataset_path is None:
-            raise ValueError(
-                f"Unknown dataset_name '{dataset_name}'. "
-                f"Available: {list(self.DATASET_PATHS.keys())}"
-            )
-        dataset_path = _resolve_compressed_path(dataset_path)
-        if not os.path.exists(dataset_path):
-            raise FileNotFoundError(f"Dataset file not found: {dataset_path}")
+        solvent_smiles_map: Dict[str, str] = {}
+        salt_smiles_map: Dict[str, str] = {}
+        for item in self.raw_data:
+            for sol in item.get('solvents', []):
+                name = sol.get('name', '')
+                smiles = sol.get('smiles', '')
+                if name and smiles:
+                    solvent_smiles_map[name] = smiles
+            salt = item.get('salts', {})
+            salt_name = salt.get('name', '')
+            salt_smiles = salt.get('smiles', '')
+            if salt_name and salt_smiles:
+                salt_smiles_map[salt_name] = salt_smiles
 
-        processed_dir = os.path.join(_PROJECT_DIR, "processed")
-        os.makedirs(processed_dir, exist_ok=True)
-        processed_path = os.path.join(processed_dir, f"{dataset_name}.pt")
+        self._graph_cache = precompute_all_molecule_graphs(solvent_smiles_map, salt_smiles_map)
 
-        need_process = force_reprocess or not os.path.exists(processed_path)
-        if not need_process and os.path.exists(dataset_path):
-            raw_mtime = os.path.getmtime(dataset_path)
-            proc_mtime = os.path.getmtime(processed_path)
-            if raw_mtime > proc_mtime:
-                need_process = True
-
-        if need_process:
-            self.process(dataset_path, processed_path)
+        print("Processing data...")
+        dataset_process_path = os.path.join(
+            PROCESSED_DIR, f"{dataset_name}_rdkit_v5_max{self.max_samples}.pkl"
+        )
+        if os.path.exists(dataset_process_path):
+            with open(dataset_process_path, 'rb') as f:
+                self.data = pickle.load(f)
+            print(f"Loaded from cache: {dataset_process_path}")
         else:
-            print(f"Loading processed dataset from {processed_path}")
-            cache = torch.load(processed_path, map_location="cpu")
-            self.unique_graphs = cache["unique_graphs"]
-            self.processed_data = cache["processed_data"]
+            self.data = self.process(self.raw_data)
+            with open(dataset_process_path, 'wb') as f:
+                pickle.dump(self.data, f)
+            print(f"Cached to: {dataset_process_path}")
+        print(f"dataset total length: {len(self.data)}")
 
-        self.processed_data = self.processed_data[: self.max_samples]
-        print(f"Dataset processed length: {len(self.processed_data)}")
+    def __len__(self):
+        return len(self.data)
 
-    def process(self, dataset_path, processed_path):
-        """
-        处理原始数据并缓存到 processed_path。
-        通过 unique_graphs 列表去重，processed_data 中只存储索引，
-        实现不同样本间相同分子图的高效共享。
-        """
-        raw_data = self._load_dataset(dataset_path)
-        print(f"Dataset raw length: {len(raw_data)}")
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        solvent_graphs = []
+        for name in item['solvent_names']:
+            g = self._graph_cache.get(name)
+            if g is not None:
+                solvent_graphs.append(g)
+        salt_graph = self._graph_cache.get(item['salt'], None)
+        return {
+            'k': item['k'],
+            'T': item['T'],
+            'c': item['c'],
+            'salt': item['salt'],
+            'graphs': solvent_graphs,
+            'salt_graphs': [salt_graph] if salt_graph is not None else [],
+            'ratios': torch.tensor(item['ratios'], dtype=torch.float32),
+        }
 
-        # 预计算所有已知分子图
-        graph_cache = precompute_all_molecule_graphs()
-        # smiles -> name 反向映射
-        smiles_to_name: Dict[str, str] = {}
-        for name, smiles in solvent_smiles_map.items():
-            if smiles:
-                smiles_to_name[smiles] = name
-        for name, smiles in salt_smiles_map.items():
-            if smiles:
-                smiles_to_name[smiles] = name
+    def load_dataset(self):
+        path = _resolve_data_path(self.dataset_name)
+        with _open_json(path) as f:
+            data = json.load(f)
+        return data[:self.max_samples]
 
-        # 去重后的图列表和映射
-        unique_graphs: List[Data] = []
-        graph_key_to_idx: Dict[str, int] = {}
-
-        def _canonical_key(key: str) -> Optional[str]:
-            """返回用于去重的 canonical key（优先使用 name）。"""
-            if not key:
-                return None
-            if key in graph_cache:
-                return key
-            if key in smiles_to_name:
-                return smiles_to_name[key]
-            return key
-
-        def _get_or_add_graph(key: str) -> Optional[int]:
-            """获取或添加图，返回在 unique_graphs 中的索引。"""
-            canon = _canonical_key(key)
-            if canon is None:
-                return None
-            if canon in graph_key_to_idx:
-                return graph_key_to_idx[canon]
-
-            # 生成图对象
-            if key in graph_cache:
-                graph = graph_cache[key]
-            elif key in smiles_to_name:
-                graph = graph_cache.get(smiles_to_name[key])
-            else:
-                graph = smiles_to_pyg_data(key)
-
-            if graph is None:
-                return None
-
-            graph_key_to_idx[canon] = len(unique_graphs)
-            unique_graphs.append(graph)
-            return graph_key_to_idx[canon]
-
-        processed_data: List[Dict] = []
-        dropped = 0
+    def process(self, raw_data):
+        processed = []
         for item in raw_data:
-            solvent_indices = []
-            for key in item["solvent_names"]:
-                idx = _get_or_add_graph(key)
-                if idx is not None:
-                    solvent_indices.append(idx)
-
-            salt_idx = _get_or_add_graph(item["salt"])
-            if not solvent_indices or salt_idx is None:
-                dropped += 1
+            conductivity = item.get('conductivity')
+            if conductivity is None or pd.isna(conductivity) or float(conductivity) <= 0:
                 continue
 
-            processed_data.append(
-                {
-                    "y": item["y"],
-                    "T": item["T"],
-                    "c": item["c"],
-                    "salt": item["salt"],
-                    "salt_idx": _salt_to_idx.get(
-                        item["salt_name"] if item["salt_name"] else item["salt"], -1
-                    ),
-                    "solvent_graph_indices": solvent_indices,
-                    "salt_graph_idx": salt_idx,
-                    "solvent_ratios": item["solvent_ratios"],
-                }
-            )
-
-        print(
-            f"Dataset processed length: {len(processed_data)} (dropped {dropped}), "
-            f"unique graphs: {len(unique_graphs)}"
-        )
-
-        self.unique_graphs = unique_graphs
-        self.processed_data = processed_data
-
-        torch.save(
-            {"unique_graphs": unique_graphs, "processed_data": processed_data},
-            processed_path,
-        )
-        print(f"Saved processed dataset to {processed_path}")
-
-    def _load_dataset(self, dataset_path):
-        dataset_path = _resolve_compressed_path(dataset_path)
-        with _open_json(dataset_path) as f:
-            raw_data = json.load(f)
-
-        data = []
-        for item in raw_data:
-            conductivity = float(item.get("conductivity", 0))
-            temperature = float(item.get("temperature", 298.15))
-            if conductivity <= 0:
-                continue
-
-            solvents = []
-            solvent_ratios = []
-            solvent_names = []
-
-            for s in item.get("solvents", []):
-                name = s.get("name", "") or ""
-                smiles = s.get("smiles", "") or ""
-                ratio = s.get("solvents_mol_ratio", 0)
-                if not name and not smiles:
-                    continue
-                if pd.isna(ratio) or ratio <= 0:
-                    continue
-                # lookup key: prefer name if available, otherwise smiles
-                lookup_key = name if name else smiles
-                solvents.append(lookup_key)
-                solvent_ratios.append(float(ratio))
-                solvent_names.append(lookup_key)
-
+            solvents = item.get('solvents', [])
             if not solvents:
                 continue
 
-            salt_info = item.get("salts", {})
-            # Defensive: handle list-form salts (some datasets may use a list)
-            if isinstance(salt_info, list) and salt_info:
-                salt_info = salt_info[0]
-            elif not isinstance(salt_info, dict):
-                salt_info = {}
+            solvent_names = []
+            ratios = []
+            for sol in solvents:
+                name = sol.get('name', '')
+                ratio = sol.get('solvents_mol_ratio', 0)
+                if name and float(ratio) > 0:
+                    solvent_names.append(name)
+                    ratios.append(float(ratio))
 
-            salt_name = salt_info.get("name", "") or ""
-            salt_smiles = salt_info.get("smiles", "") or ""
-            salt_key = salt_name if salt_name else salt_smiles
-            salt_mol_ratio = float(salt_info.get("mol_ratio", 0))
+            if not solvent_names:
+                continue
 
-            data.append(
-                {
-                    "solvents": solvents,
-                    "solvent_ratios": solvent_ratios,
-                    "solvent_names": solvent_names,
-                    "salt": salt_key,
-                    "salt_name": salt_name,
-                    "salt_mol_ratio": salt_mol_ratio,
-                    "T": temperature,
-                    "y": conductivity,
-                    "c": salt_mol_ratio,
-                }
-            )
-        return data
+            salt_info = item.get('salts', {})
+            salt_name = salt_info.get('name', '')
+            if not salt_name:
+                continue
 
-    def __len__(self):
-        return len(self.processed_data)
+            c_val = float(salt_info.get('mol_ratio', 0))
+            T_val = float(item.get('temperature', 298.15))
+            y_val = float(conductivity)
 
-    def __getitem__(self, idx):
-        item = self.processed_data[idx]
-        return {
-            "y": item["y"],
-            "T": item["T"],
-            "c": item["c"],
-            "salt": item["salt"],
-            "salt_idx": item["salt_idx"],
-            "solvent_graphs": [self.unique_graphs[i] for i in item["solvent_graph_indices"]],
-            "salt_graph": self.unique_graphs[item["salt_graph_idx"]],
-            "solvent_ratios": item["solvent_ratios"],
-        }
+            processed.append({
+                'k': y_val,
+                'T': T_val,
+                'c': c_val,
+                'salt': salt_name,
+                'solvent_names': solvent_names,
+                'ratios': ratios,
+            })
+        return processed
+
+
+# ---------------------------------------------------------------------------
+# Collate
+# ---------------------------------------------------------------------------
+def solv_mix_collate_fn_optimized(batch, device='cpu', seq_len=8):
+    batch_size = len(batch)
+    y_values = torch.empty(batch_size, dtype=torch.float32)
+    T_values = torch.empty(batch_size, dtype=torch.float32)
+    c_values = torch.empty(batch_size, dtype=torch.float32)
+    salt_one_hot = torch.zeros(batch_size, len(salt_list), dtype=torch.float32)
+
+    for idx, item in enumerate(batch):
+        y_values[idx] = item['k']
+        T_values[idx] = item['T']
+        c_values[idx] = item['c']
+        sidx = _salt_to_idx.get(item['salt'], -1)
+        if sidx >= 0:
+            salt_one_hot[idx, sidx] = 1.0
+
+    all_solvent_graphs = []
+    all_salt_graphs = []
+    g2b_solvent = []
+    g2b_salt = []
+    batch_ratios_list = []
+
+    for sample_idx, item in enumerate(batch):
+        for g in item['graphs']:
+            all_solvent_graphs.append(g)
+            g2b_solvent.append(sample_idx)
+        batch_ratios_list.extend(item['ratios'].tolist())
+        for g in item['salt_graphs']:
+            all_salt_graphs.append(g)
+            g2b_salt.append(sample_idx)
+
+    batch_ratios = torch.tensor(batch_ratios_list, dtype=torch.float32)
+
+    if all_solvent_graphs:
+        batch_solvents = Batch.from_data_list(all_solvent_graphs)
+        ptr = batch_solvents.ptr
+        n2g_solvent = torch.arange(len(ptr) - 1, dtype=torch.long).repeat_interleave((ptr[1:] - ptr[:-1]))
+        g2b_solvent_tensor = torch.tensor(g2b_solvent, dtype=torch.long)
+        n2b_solvent = g2b_solvent_tensor[n2g_solvent]
+    else:
+        batch_solvents = Data(
+            x=torch.zeros(1, 152, dtype=torch.float32),
+            edge_index=torch.zeros(2, 0, dtype=torch.long),
+            edge_attr=torch.zeros(0, 13, dtype=torch.float32)
+        )
+        n2g_solvent = torch.tensor([0], dtype=torch.long)
+        g2b_solvent_tensor = torch.tensor([0], dtype=torch.long)
+        n2b_solvent = torch.tensor([0], dtype=torch.long)
+
+    if all_salt_graphs:
+        batch_salts = Batch.from_data_list(all_salt_graphs)
+        salt_ptr = batch_salts.ptr
+        n2g_salt = torch.arange(len(salt_ptr) - 1, dtype=torch.long).repeat_interleave((salt_ptr[1:] - salt_ptr[:-1]))
+        g2b_salt_tensor = torch.tensor(g2b_salt, dtype=torch.long)
+        n2b_salt = g2b_salt_tensor[n2g_salt]
+    else:
+        batch_salts = Data(
+            x=torch.zeros(1, 152, dtype=torch.float32),
+            edge_index=torch.zeros(2, 0, dtype=torch.long),
+            edge_attr=torch.zeros(0, 13, dtype=torch.float32)
+        )
+        n2g_salt = torch.tensor([], dtype=torch.long)
+        g2b_salt_tensor = torch.tensor([], dtype=torch.long)
+        n2b_salt = torch.tensor([], dtype=torch.long)
+
+    if n2g_solvent.numel() > 0:
+        n2g_max = int(n2g_solvent.max().item())
+    else:
+        n2g_max = -1
+
+    if n2g_salt.numel() > 0:
+        n2g_salt_shifted = n2g_salt + n2g_max + 1
+        n2g_indices = torch.cat([n2g_solvent, n2g_salt_shifted], dim=0)
+    else:
+        n2g_indices = n2g_solvent.clone()
+
+    n2b_indices = torch.cat([n2b_solvent, n2b_salt], dim=0)
+    g2b_indices = torch.cat([g2b_solvent_tensor, g2b_salt_tensor], dim=0)
+
+    batch_solvents.n2g_indices = n2g_solvent
+    batch_solvents.n2b_indices = n2b_solvent
+    batch_solvents.g2b_indices = g2b_solvent_tensor
+    batch_salts.n2g_indices = n2g_salt
+    batch_salts.n2b_indices = n2b_salt
+    batch_salts.g2b_indices = g2b_salt_tensor
+
+    # Precompute pos_idx for scatter_batch
+    counts = g2b_indices.bincount(minlength=batch_size)
+    max_mols = int(counts.max().item())
+    seq_len = max(seq_len, max_mols)
+
+    sorted_idx = torch.argsort(g2b_indices)
+    sorted_samples = g2b_indices[sorted_idx]
+    sorted_pos = torch.arange(len(g2b_indices))
+    group_starts = torch.cat([
+        torch.tensor([True]),
+        sorted_samples[1:] != sorted_samples[:-1]
+    ])
+    group_start_pos = torch.zeros_like(sorted_pos)
+    group_start_pos[group_starts] = sorted_pos[group_starts]
+    group_start_expanded = group_start_pos.cummax(0).values
+    sorted_pos_within_group = sorted_pos - group_start_expanded
+    pos_idx = torch.empty_like(sorted_pos_within_group)
+    pos_idx[sorted_idx] = sorted_pos_within_group
+    pos_idx = pos_idx.clamp(max=seq_len - 1)
+
+    return {
+        'y': y_values.to(device, non_blocking=True),
+        'T': T_values.to(device, non_blocking=True),
+        'c': c_values.to(device, non_blocking=True),
+        'salt_one_hot': salt_one_hot.to(device, non_blocking=True),
+        'batch': batch_solvents.to(device),
+        'salt_batch': batch_salts.to(device),
+        'n2g_indices': n2g_indices.to(device),
+        'n2b_indices': n2b_indices.to(device),
+        'g2b_indices': g2b_indices.to(device),
+        'ratios': batch_ratios.to(device, non_blocking=True),
+        'pos_idx': pos_idx.to(device),
+        'seq_len': seq_len,
+    }

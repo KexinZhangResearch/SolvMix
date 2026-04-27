@@ -1,6 +1,5 @@
 import glob
 import os
-from functools import partial
 
 import hydra
 import pytorch_lightning as pl
@@ -12,119 +11,39 @@ from pytorch_lightning.loggers import WandbLogger
 
 from src.callbacks import EfficientEMACallback
 from src.dataloader import build_dataloaders
-from src.model import (
-    SolvMix,
-    make_regression_loss,
-    regression_metrics,
-)
-
-
-# ================== Config loader ==================
-
-_CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs")
-
-
-def load_config(config_name: str = "base"):
-    """Load a hierarchical OmegaConf config with defaults resolution.
-
-    Supports lookup modes:
-      - ``config_name``              -> configs/{config_name}.yaml
-      - fallback                     -> configs/experiments/{config_name}.yaml
-      - relative path with ``/``     -> resolved against project root
-    """
-    _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-
-    # Determine main_path
-    if "/" in config_name or "\\" in config_name:
-        main_path = os.path.join(_PROJECT_ROOT, config_name)
-        if not main_path.endswith(".yaml"):
-            main_path += ".yaml"
-    else:
-        name = config_name if config_name.endswith(".yaml") else f"{config_name}.yaml"
-        main_path = os.path.join(_CONFIG_DIR, name)
-        if not os.path.exists(main_path):
-            # Fallback to experiments/ directory
-            exp_path = os.path.join(_CONFIG_DIR, "experiments", name)
-            if os.path.exists(exp_path):
-                main_path = exp_path
-
-    if not os.path.exists(main_path):
-        raise FileNotFoundError(f"Config not found: {main_path}")
-
-    cfg = OmegaConf.load(main_path)
-
-    # Resolve defaults before merging self
-    merged = OmegaConf.create()
-    if "defaults" in cfg:
-        defaults = cfg.pop("defaults")
-        for item in defaults:
-            if isinstance(item, dict) and "_self_" in item:
-                continue
-            # String default: inherit from another config file, e.g. - base
-            if isinstance(item, str) and item != "_self_":
-                sub_cfg = load_config(item)
-                merged = OmegaConf.merge(merged, sub_cfg)
-                continue
-            # OmegaConf defaults item can be a DictConfig like {'data': 'edb1'}
-            if hasattr(item, "keys") and len(item.keys()) == 1:
-                group = list(item.keys())[0]
-                name = item[group]
-                sub_path = os.path.join(_CONFIG_DIR, group, f"{name}.yaml")
-                if not os.path.exists(sub_path):
-                    raise FileNotFoundError(f"Default config not found: {sub_path}")
-                sub_cfg = OmegaConf.load(sub_path)
-                merged = OmegaConf.merge(merged, sub_cfg)
-
-    # Main config overrides defaults
-    cfg = OmegaConf.merge(merged, cfg)
-    return cfg
+from src.metrics import regression_metrics
+from src.model import SolvMix
 
 
 # ================== Lightning module ==================
 
 
-class ElectrolyteModuleSolvMix(pl.LightningModule):
+class SolvMixWrapper(pl.LightningModule):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        # Save only the flattened dict for checkpoint compatibility
         self.save_hyperparameters(OmegaConf.to_container(cfg, resolve=True))
 
         m_cfg = cfg.model
         self.model = SolvMix(
-            num_layer=m_cfg.num_conv_layer,
+            num_gnn_blocks=m_cfg.num_gnn_blocks,
             node_input_dim=152,
             edge_attr_dim=13,
-            hidden_dim=m_cfg.graph_hidden_dim,
-            num_atten_layer=m_cfg.num_atten_layer,
+            hidden_dim=m_cfg.hidden_dim,
+            num_mlp_layer=m_cfg.num_mlp_layer,
+            num_token_blocks=m_cfg.num_token_blocks,
             num_atten_head=m_cfg.num_atten_head,
-            num_atom_interaction_layer=m_cfg.num_atom_interaction_layer,
+            num_atom_blocks=m_cfg.num_atom_blocks,
             seq_len=cfg.data.seq_len,
-            dropout=m_cfg.dropout,
-            attn_dropout=m_cfg.att_dropout,
-            resid_dropout=m_cfg.resid_dropout,
-            ffn_mult=m_cfg.ffn_mult,
-            norm_type=m_cfg.norm_type,
-            cond_mode=m_cfg.cond_mode,
-            token_pool=m_cfg.token_pool,
-            use_type_emb=m_cfg.use_type_emb,
-            use_amount_emb=m_cfg.use_amount_emb,
-            use_relation=m_cfg.use_relation,
-            use_relation_attn=m_cfg.use_relation_attn,
-            relation_dim=m_cfg.relation_dim,
-            use_decomp=m_cfg.use_decomp,
-            use_global_token=m_cfg.use_global_token,
-            atom_mod_mode=m_cfg.atom_mod_mode,
-            token_block_mod=m_cfg.token_block_mod,
-            separate_amount_emb=m_cfg.separate_amount_emb,
             device="cpu",
+            if_c_gate=m_cfg.if_c_gate,
         )
-        t_cfg = cfg.train
-        self.loss_fn = make_regression_loss(t_cfg.loss_type)
+        self.loss_fn = torch.nn.MSELoss()
+        self.mae_fn = torch.nn.L1Loss()
         self.validation_step_outputs = []
         self.test_step_outputs = []
 
-    def forward(self, batch, **overrides):
+    def forward(self, batch):
         return self.model(
             batch["batch"],
             batch["salt_batch"],
@@ -133,118 +52,83 @@ class ElectrolyteModuleSolvMix(pl.LightningModule):
             batch["g2b_indices"],
             batch["T"],
             batch["c"],
-            salt_one_hot=batch.get("salt_one_hot", None),
-            ratios=batch.get("ratios", None),
-            graph_types=batch.get("graph_types", None),
-            graph_amounts=batch.get("graph_amounts", None),
-            inter_edge_index=batch.get("inter_edge_index", None),
-            batch_size=batch.get("batch_size", None),
-            **overrides,
+            batch.get("ratios"),
+            batch.get("pos_idx"),
+            batch.get("seq_len"),
         )
-
-    def _log_target(self, y):
-        return torch.log1p(y.clamp_min(0))
-
-    def _raw_pred(self, log_pred):
-        return torch.expm1(log_pred).clamp_min(0)
-
-    def _prediction_loss(self, log_pred, y):
-        return self.loss_fn(log_pred, self._log_target(y))
-
-    def _smoothness_loss(self, batch, log_pred, aux):
-        t_cfg = self.cfg.train
-        if not t_cfg.use_smooth:
-            return torch.zeros((), device=log_pred.device, dtype=log_pred.dtype), {}
-
-        T = batch["T"]
-        c = batch["c"]
-        T_aug = (T + torch.randn_like(T) * t_cfg.smooth_T_std).clamp_min(1e-6)
-        c_aug = (c + torch.randn_like(c) * t_cfg.smooth_c_std).clamp_min(0.0)
-
-        log_pred_aug, aux_aug = self(batch, T_override=T_aug, c_override=c_aug)
-        loss_cond = F.mse_loss(log_pred_aug, log_pred.detach())
-        s1 = F.normalize(aux["mixture_state"], dim=-1)
-        s2 = F.normalize(aux_aug["mixture_state"], dim=-1)
-        loss_emb = F.mse_loss(s2, s1.detach())
-
-        smooth = (
-            t_cfg.lambda_cond_smooth * loss_cond
-            + t_cfg.lambda_emb_smooth * loss_emb
-        )
-        return smooth, {
-            "loss_cond_smooth": loss_cond.detach(),
-            "loss_emb_smooth": loss_emb.detach(),
-        }
 
     def training_step(self, batch, batch_idx):
-        log_pred, aux = self(batch)
-        loss_pred = self._prediction_loss(log_pred, batch["y"])
-        smooth_loss, smooth_logs = self._smoothness_loss(batch, log_pred, aux)
-        sparse_loss = aux.get("sparse_reg", torch.zeros_like(loss_pred))
-        t_cfg = self.cfg.train
-        total_loss = loss_pred + smooth_loss + t_cfg.lambda_sparse * sparse_loss
-
-        self.log("train/loss", total_loss, prog_bar=True, batch_size=batch["y"].size(0))
-        if t_cfg.log_aux_train_loss:
-            self.log(f"train/{t_cfg.loss_type}_log_loss", loss_pred, batch_size=batch["y"].size(0))
-            self.log("train/sparse_reg", sparse_loss, batch_size=batch["y"].size(0))
-            for k, v in smooth_logs.items():
-                self.log(f"train/{k}", v, batch_size=batch["y"].size(0))
-        return total_loss
-
-    def _eval_step(self, batch, stage):
-        log_pred, aux = self(batch)
-        loss = self._prediction_loss(log_pred, batch["y"])
-        raw_pred = self._raw_pred(log_pred).detach()
-        raw_target = batch["y"].detach()
-        self.log(f"{stage}/loss", loss, sync_dist=True, batch_size=raw_target.size(0))
-        return {"pred": raw_pred, "target": raw_target, "loss": loss.detach()}
+        log_pred = self(batch)
+        log_target = torch.log1p(batch["y"])
+        loss = self.loss_fn(log_pred, log_target)
+        self.log("train/loss", loss, prog_bar=True, batch_size=batch["y"].size(0))
+        if self.trainer.optimizers:
+            lr = self.trainer.optimizers[0].param_groups[0]["lr"]
+            self.log("lr", lr, prog_bar=False, batch_size=batch["y"].size(0))
+        return loss
 
     def validation_step(self, batch, batch_idx):
-        out = self._eval_step(batch, "val")
-        self.validation_step_outputs.append(out)
-        return out
-
-    def test_step(self, batch, batch_idx):
-        out = self._eval_step(batch, "test")
-        self.test_step_outputs.append(out)
-        return out
-
-    def _epoch_end_metrics(self, outputs, stage):
-        if not outputs:
-            return
-        preds = torch.cat([x["pred"] for x in outputs])
-        targets = torch.cat([x["target"] for x in outputs])
-        for name, value in regression_metrics(preds, targets).items():
-            self.log(f"{stage}/{name}", value, sync_dist=True,
-                     prog_bar=(name in {"r2", "mae", "rmse"}))
-        # Log histograms for test stage
-        if stage == "test" and hasattr(self, "logger") and self.logger is not None:
-            try:
-                import wandb as _wandb
-                _wandb.log({
-                    "test/pred_hist": _wandb.Histogram(preds.detach().cpu().numpy()),
-                    "test/target_hist": _wandb.Histogram(targets.detach().cpu().numpy()),
-                    "test/error_hist": _wandb.Histogram((preds - targets).detach().cpu().numpy()),
-                })
-            except Exception:
-                pass
-        outputs.clear()
+        log_pred = self(batch)
+        pred = torch.exp(log_pred) - 1
+        loss = self.loss_fn(pred, batch["y"])
+        self.log("val/loss", loss, sync_dist=True, batch_size=batch["y"].size(0))
+        self.validation_step_outputs.append({"pred": pred.detach(), "target": batch["y"].detach()})
+        return {"pred": pred.detach(), "target": batch["y"].detach()}
 
     def on_validation_epoch_end(self):
-        self._epoch_end_metrics(self.validation_step_outputs, "val")
+        if self.validation_step_outputs:
+            preds = torch.cat([x["pred"] for x in self.validation_step_outputs])
+            targets = torch.cat([x["target"] for x in self.validation_step_outputs])
+            for name, value in regression_metrics(preds, targets).items():
+                self.log(f"val/{name}", value, sync_dist=True, prog_bar=(name in {"r2", "pearson"}))
+        self.validation_step_outputs.clear()
+
+    def test_step(self, batch, batch_idx):
+        log_pred = self(batch)
+        pred = torch.exp(log_pred) - 1
+        loss = self.loss_fn(pred, batch["y"])
+        self.log("test/loss", loss, sync_dist=True, batch_size=batch["y"].size(0))
+        self.test_step_outputs.append({"pred": pred.detach(), "target": batch["y"].detach()})
+        return {"pred": pred.detach(), "target": batch["y"].detach()}
 
     def on_test_epoch_end(self):
-        self._epoch_end_metrics(self.test_step_outputs, "test")
+        if self.test_step_outputs:
+            preds = torch.cat([x["pred"] for x in self.test_step_outputs])
+            targets = torch.cat([x["target"] for x in self.test_step_outputs])
+            for name, value in regression_metrics(preds, targets).items():
+                self.log(f"test/{name}", value, sync_dist=True)
+            # Log histograms
+            if hasattr(self, "logger") and self.logger is not None:
+                try:
+                    import wandb as _wandb
+                    _wandb.log({
+                        "test/pred_hist": _wandb.Histogram(preds.detach().cpu().numpy()),
+                        "test/target_hist": _wandb.Histogram(targets.detach().cpu().numpy()),
+                        "test/error_hist": _wandb.Histogram((preds - targets).detach().cpu().numpy()),
+                    })
+                except Exception:
+                    pass
+        self.test_step_outputs.clear()
 
     def configure_optimizers(self):
         t_cfg = self.cfg.train
+        decay_params = []
+        no_decay_params = []
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if "norm" in name.lower() or name.endswith("bias"):
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+
+        optimizer_group = [
+            {"params": decay_params, "weight_decay": t_cfg.weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ]
         opt_class = torch.optim.AdamW if t_cfg.optimizer == "AdamW" else torch.optim.Adam
-        optimizer = opt_class(
-            self.parameters(),
-            lr=t_cfg.learning_rate,
-            weight_decay=t_cfg.weight_decay,
-        )
+        optimizer = opt_class(optimizer_group, lr=t_cfg.learning_rate)
+
         warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
             optimizer,
             start_factor=1e-5,
@@ -263,25 +147,13 @@ class ElectrolyteModuleSolvMix(pl.LightningModule):
         return [optimizer], [{"scheduler": scheduler, "interval": "step"}]
 
 
-class SolvMixOptimizerCallback(pl.Callback):
-    def __init__(self, learning_rate, weight_decay, warmup_steps, lr_gamma, optimizer_name="AdamW"):
-        super().__init__()
-        self.learning_rate = learning_rate
-        self.weight_decay = weight_decay
-        self.warmup_steps = warmup_steps
-        self.lr_gamma = lr_gamma
-        self.optimizer_name = optimizer_name
-
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        if trainer.optimizers:
-            lr = trainer.optimizers[0].param_groups[0]["lr"]
-            pl_module.log("lr", lr, prog_bar=False, batch_size=batch["y"].size(0))
-
-
 # ================== Runner ==================
+# Resolve config dir relative to this script so it works regardless of cwd
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_CONFIG_PATH = os.path.join(_SCRIPT_DIR, "src", "configs")
 
 
-@hydra.main(config_path="configs", config_name="base", version_base=None)
+@hydra.main(config_path=_CONFIG_PATH, config_name="base", version_base=None)
 def main(cfg: DictConfig) -> None:
     if getattr(cfg, "wandb_api_key", None):
         os.environ["WANDB_API_KEY"] = cfg.wandb_api_key
@@ -299,7 +171,7 @@ def main(cfg: DictConfig) -> None:
         torch.set_float32_matmul_precision("high")
         torch.backends.cudnn.benchmark = True
 
-    train_loader, val_loader, test_loader = build_dataloaders(cfg)
+    train_loader, val_loader, test_loader, cache_dir = build_dataloaders(cfg)
 
     _solv_mix_root = os.path.dirname(os.path.abspath(__file__))
     ckpt_dir = os.path.join(_solv_mix_root, "wandb", "checkpoints", cfg.exp_name)
@@ -318,15 +190,7 @@ def main(cfg: DictConfig) -> None:
     t_cfg = cfg.train
     if t_cfg.use_ema:
         callbacks.append(EfficientEMACallback(decay=t_cfg.ema_decay))
-    callbacks.append(SolvMixOptimizerCallback(
-        learning_rate=t_cfg.learning_rate,
-        weight_decay=t_cfg.weight_decay,
-        warmup_steps=t_cfg.warmup_steps,
-        lr_gamma=t_cfg.lr_gamma,
-        optimizer_name=t_cfg.optimizer,
-    ))
 
-    # Wandb logs saved under SolvMix/wandb/wandb/<run-folder>/ (default wandb layout)
     _solv_mix_root = os.path.dirname(os.path.abspath(__file__))
     wandb_root = os.path.join(_solv_mix_root, "wandb")
     os.makedirs(wandb_root, exist_ok=True)
@@ -361,7 +225,10 @@ def main(cfg: DictConfig) -> None:
 
     trainer = pl.Trainer(**trainer_kwargs)
 
-    model = ElectrolyteModuleSolvMix(cfg)
+    model = SolvMixWrapper(cfg)
+
+    if cfg.data.batch_size is None:
+        model.model.enable_cache()
 
     if cfg.compile and hasattr(torch, "compile"):
         try:
@@ -370,7 +237,6 @@ def main(cfg: DictConfig) -> None:
         except Exception as e:
             print(f"[torch.compile] Warning: compilation failed, falling back to eager mode. Error: {e}")
 
-    # Record existing wandb run dirs before training
     wandb_subdir = os.path.join(wandb_root, "wandb")
     pre_existing = set(os.listdir(wandb_subdir)) if os.path.exists(wandb_subdir) else set()
 
@@ -387,7 +253,11 @@ def main(cfg: DictConfig) -> None:
         trainer.fit(model, train_loader, val_loader)
         trainer.test(dataloaders=test_loader, ckpt_path="best")
 
-    # Rename the newly created wandb run dir to <exp_name>--<datetime>--<mode>
+    if cache_dir is not None:
+        import shutil
+        print(f"[v5] Cleaning up full-batch cache: {cache_dir}")
+        shutil.rmtree(cache_dir, ignore_errors=True)
+
     post_existing = set(os.listdir(wandb_subdir)) if os.path.exists(wandb_subdir) else set()
     new_dirs = [
         d for d in (post_existing - pre_existing)

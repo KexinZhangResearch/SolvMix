@@ -227,3 +227,8 @@ processed/
 configs/experiments
 raw/*.json
 outputs/
+src_old/
+GeoMix/
+plots/
+.vscode/
+cache/

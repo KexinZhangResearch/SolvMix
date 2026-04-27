@@ -1,0 +1,11 @@
+# @package _global_
+# Debug experiment
+exp_name: DEBUG
+
+model:
+  if_c_gate: true
+
+train:
+  epochs: 20000
+
+wandb_api_key: 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
