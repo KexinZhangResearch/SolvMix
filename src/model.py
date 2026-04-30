@@ -1,3 +1,4 @@
+from audioop import bias
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,22 +7,8 @@ from torch_scatter import scatter, scatter_mean
 from .utils import scatter_batch, get_intergraph_edge_index
 
 
-# ================== SwiGLU FFN ==================
-class SwiGLUFFN(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, hidden_factor=8 / 3, multiple=32):
-        super().__init__()
-        hidden_dim = int(hidden_dim * hidden_factor)
-        hidden_dim = ((hidden_dim + multiple - 1) // multiple) * multiple
-        self.w12 = nn.Linear(input_dim, 2 * hidden_dim)
-        self.w3 = nn.Linear(hidden_dim, output_dim)
-
-    def forward(self, x):
-        x1, x2 = self.w12(x).chunk(2, dim=-1)
-        return self.w3(F.silu(x1) * x2)
-
-
 class MLP(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, num_layers=3, last_act="none"):
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers=2):
         super().__init__()
         assert num_layers >= 2
         layers = []
@@ -31,31 +18,19 @@ class MLP(nn.Module):
             layers.append(nn.Linear(hidden_dim, hidden_dim))
             layers.append(nn.SiLU())
         layers.append(nn.Linear(hidden_dim, output_dim))
-        if last_act != "none":
-            if last_act == "relu":
-                layers.append(nn.ReLU())
-            elif last_act == "silu":
-                layers.append(nn.SiLU())
-            elif last_act == "softplus":
-                layers.append(nn.Softplus())
-            elif last_act == "sigmoid":
-                layers.append(nn.Sigmoid())
-            else:
-                raise ValueError(f"Unknown last activation function: {last_act}")
         self.mlp = nn.Sequential(*layers)
 
     def forward(self, x):
         return self.mlp(x)
 
 
-# ================== Transformer ==================
 class TransformerBlock(nn.Module):
     def __init__(self, dim, nhead):
         super().__init__()
         self.attn_norm = nn.LayerNorm(dim)
         self.attn = nn.MultiheadAttention(dim, nhead, batch_first=True)
         self.ffn_norm = nn.LayerNorm(dim)
-        self.ffn = SwiGLUFFN(dim, dim, dim)
+        self.ffn = MLP(dim, dim*4, dim)
 
     def forward(self, x, key_padding_mask=None):
         x_norm = self.attn_norm(x)
@@ -65,37 +40,6 @@ class TransformerBlock(nn.Module):
             need_weights=False,
         )[0]
         x = x + self.ffn(self.ffn_norm(x))
-        return x
-
-
-class Transformer(nn.Module):
-    def __init__(
-        self,
-        input_dim,
-        hidden_dim,
-        output_dim,
-        num_layer=4,
-        num_heads=8,
-        pooling=True,
-    ):
-        super().__init__()
-        self.pooling = pooling
-        self.blocks = nn.ModuleList(
-            [TransformerBlock(hidden_dim, num_heads) for _ in range(num_layer)]
-        )
-        self.fc_out = nn.Linear(hidden_dim, output_dim)
-
-    def forward(self, x, key_padding_mask=None):
-        for block in self.blocks:
-            x = block(x, key_padding_mask=key_padding_mask)
-        if self.pooling:
-            if key_padding_mask is not None:
-                x = x.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
-                valid_len = (~key_padding_mask).sum(dim=1, keepdim=True)  # (B, 1)
-                x = x.sum(dim=1) / valid_len.clamp(min=1)  # (B, D)
-            else:
-                x = x.mean(dim=1)
-        x = self.fc_out(x)
         return x
 
 
@@ -115,7 +59,86 @@ class TokenInteractionModule(nn.Module):
         return x
 
 
-# ================== BaseMLP_2 ==================
+# ================== GNN ==================
+class GraphEncoderBlock(nn.Module):
+    def __init__(self, edge_attr_dim, hidden_dim):
+        super().__init__()
+        self.mlp_msg = MLP(2 * hidden_dim + edge_attr_dim, hidden_dim, hidden_dim)
+        self.mlp_node = MLP(2 * hidden_dim, hidden_dim, hidden_dim)
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, h, edge_index, edge_attr):
+        row, col = edge_index
+        if edge_attr.dim() == 1:
+            edge_attr = edge_attr.unsqueeze(-1)
+        msg = torch.cat([h[row], h[col], edge_attr], dim=-1)
+        msg = self.mlp_msg(msg)
+        msg_agg = scatter(msg, row, dim=0, dim_size=h.size(0), reduce='mean')
+        h_new = self.mlp_node(torch.cat([h, msg_agg], dim=-1))
+        h = self.norm(h + h_new)
+        return h
+
+
+class GraphEncoder(nn.Module):
+    def __init__(self, num_layer, node_input_dim, edge_attr_dim, hidden_dim):
+        super().__init__()
+        self.embedding = nn.Linear(node_input_dim, hidden_dim)
+        self.layers = nn.ModuleList(
+            [GraphEncoderBlock(edge_attr_dim, hidden_dim)for _ in range(num_layer)])
+
+    def forward(self, h, edge_index, edge_attr):
+        h = self.embedding(h)
+        for layer in self.layers:
+            h = layer(h, edge_index, edge_attr)
+        return h
+
+
+class AtomInteractionGraphBlock(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.mlp_msg = MLP(2 * hidden_dim, hidden_dim, hidden_dim)
+        self.mlp_upd = MLP(2 * hidden_dim, hidden_dim, hidden_dim)
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, h, inter_edge_index):
+        row, col = inter_edge_index
+        msg = torch.cat([h[row], h[col]], dim=-1)
+        msg = self.mlp_msg(msg)
+        agg = scatter(msg, row, dim=0, dim_size=h.size(0), reduce='mean')
+        h_new = self.mlp_upd(torch.cat([h, agg], dim=-1))
+        h = self.norm(h + h_new)
+        return h
+
+
+class AtomInteractionModule(nn.Module):
+    def __init__(self, hidden_dim, num_layer):
+        super().__init__()
+        self.layers = nn.ModuleList([AtomInteractionGraphBlock(hidden_dim) for _ in range(num_layer)])
+
+    def forward(self, h, inter_edge_index):
+        for layer in self.layers:
+            h = layer(h, inter_edge_index)
+        return h
+
+
+class AtomToTokenPool(nn.Module):
+    def __init__(self, hidden_dim, num_layer):
+        super().__init__()
+        if num_layer > 0:
+            self.layers = nn.ModuleList([AtomInteractionGraphBlock(hidden_dim) for _ in range(num_layer)])
+        else:
+            self.layers = None
+
+    def forward(self, h_atom, inter_edge_index, n2g_indices):
+        if self.layers is not None:
+            for layer in self.layers:
+                h_atom = layer(h_atom, inter_edge_index)
+
+        h_graph = scatter_mean(h_atom, n2g_indices, dim=0)
+        return h_graph
+
+
+# ================== Main Model ==================
 class BaseMLP_2(nn.Module):
     def __init__(
         self,
@@ -165,77 +188,6 @@ class BaseMLP_2(nn.Module):
         return x
 
 
-# ================== GNN ==================
-class GNNEncoderBlock(nn.Module):
-    def __init__(self, edge_attr_dim, hidden_dim, use_res_scale=False):
-        super().__init__()
-        self.mlp_msg = MLP(2 * hidden_dim + edge_attr_dim, hidden_dim, hidden_dim, last_act="none")
-        self.mlp_node = MLP(2 * hidden_dim, hidden_dim, hidden_dim, last_act="none")
-        self.norm = nn.LayerNorm(hidden_dim)
-        if use_res_scale:
-            self.res_scale = nn.Parameter(torch.zeros(1))
-        else:
-            self.res_scale = 1.
-
-    def forward(self, h, edge_index, edge_attr):
-        row, col = edge_index
-        if edge_attr.dim() == 1:
-            edge_attr = edge_attr.unsqueeze(-1)
-        msg = torch.cat([h[row], h[col], edge_attr], dim=-1)
-        msg = self.mlp_msg(msg)
-        msg_agg = scatter(msg, row, dim=0, dim_size=h.size(0), reduce='mean')
-        h_new = self.mlp_node(torch.cat([h, msg_agg], dim=-1))
-        h = self.norm(h + self.res_scale * h_new)
-        return h
-
-
-class GNNEncoder(nn.Module):
-    def __init__(self, num_layer, node_input_dim, edge_attr_dim, hidden_dim, use_res_scale=False):
-        super().__init__()
-        self.embedding = nn.Linear(node_input_dim, hidden_dim)
-        self.layers = nn.ModuleList([GNNEncoderBlock(edge_attr_dim, hidden_dim, use_res_scale)
-                                    for _ in range(num_layer)])
-
-    def forward(self, h, edge_index, edge_attr):
-        h = self.embedding(h)
-        for layer in self.layers:
-            h = layer(h, edge_index, edge_attr)
-        return h
-
-
-class AtomInteractionGNNBlock(nn.Module):
-    def __init__(self, hidden_dim, use_res_scale=False):
-        super().__init__()
-        self.mlp_msg = MLP(2 * hidden_dim, hidden_dim, hidden_dim, last_act="none")
-        self.mlp_upd = MLP(2 * hidden_dim, hidden_dim, hidden_dim, last_act="none")
-        self.norm = nn.LayerNorm(hidden_dim)
-        if use_res_scale:
-            self.res_scale = nn.Parameter(torch.zeros(1))
-        else:
-            self.res_scale = 1.
-
-    def forward(self, h, inter_edge_index):
-        row, col = inter_edge_index
-        msg = torch.cat([h[row], h[col]], dim=-1)
-        msg = self.mlp_msg(msg)
-        agg = scatter(msg, row, dim=0, dim_size=h.size(0), reduce='mean')
-        h_new = self.mlp_upd(torch.cat([h, agg], dim=-1))
-        h = self.norm(h + self.res_scale * h_new)
-        return h
-
-
-class AtomInteractionModule(nn.Module):
-    def __init__(self, hidden_dim, num_layer, use_res_scale=False):
-        super().__init__()
-        self.layers = nn.ModuleList([AtomInteractionGNNBlock(hidden_dim, use_res_scale) for _ in range(num_layer)])
-
-    def forward(self, h, inter_edge_index):
-        for layer in self.layers:
-            h = layer(h, inter_edge_index)
-        return h
-
-
-# ================== Main Model ==================
 class SolvMix(nn.Module):
     def __init__(
         self,
@@ -260,25 +212,20 @@ class SolvMix(nn.Module):
         self.use_amount_and_type_emb = use_amount_and_type_emb
         self.cond_mode = cond_mode
 
-        self.solvent_encoder = GNNEncoder(
+        self.solvent_encoder = GraphEncoder(
             num_layer=num_gnn_blocks,
             node_input_dim=node_input_dim,
             edge_attr_dim=edge_attr_dim,
             hidden_dim=hidden_dim,
-            use_res_scale=use_res_scale,
         )
-        self.salt_encoder = GNNEncoder(
+        self.salt_encoder = GraphEncoder(
             num_layer=num_gnn_blocks,
             node_input_dim=node_input_dim,
             edge_attr_dim=edge_attr_dim,
             hidden_dim=hidden_dim,
-            use_res_scale=use_res_scale,
         )
 
-        if num_atom_blocks > 0:
-            self.atom_interaction_module = AtomInteractionModule(hidden_dim, num_atom_blocks, use_res_scale)
-        else:
-            self.atom_interaction_module = None
+        self.atom_to_token_pool = AtomToTokenPool(hidden_dim, num_atom_blocks)
 
         self.token_interaction_module = TokenInteractionModule(
             hidden_dim,
@@ -288,22 +235,28 @@ class SolvMix(nn.Module):
 
         self.pool_proj = nn.Linear(hidden_dim, hidden_dim)
 
-        self.temp_token_mlp = MLP(2, hidden_dim, hidden_dim, num_layers=2, last_act="none")
-        self.conc_token_mlp = MLP(2, hidden_dim, hidden_dim, num_layers=2, last_act="none")
+        self.temp_token_mlp = MLP(2, hidden_dim, hidden_dim)
+        self.conc_token_mlp = MLP(2, hidden_dim, hidden_dim)
 
         if self.use_amount_and_type_emb:
             self.type_emb = nn.Embedding(2, hidden_dim)
-            self.solvent_amount_emb = MLP(1, hidden_dim, hidden_dim, last_act="none")
-            self.salt_amount_emb = MLP(1, hidden_dim, hidden_dim, last_act="none")
+            self.solvent_amount_emb = MLP(1, hidden_dim, hidden_dim)
+            self.salt_amount_emb = MLP(1, hidden_dim, hidden_dim)
 
         if self.use_amount_scale:
-            self.solvent_gate_mlp = MLP(1, hidden_dim, hidden_dim, last_act="none")
-            self.salt_gate_mlp = MLP(1, hidden_dim, hidden_dim, last_act="none")
+            self.solvent_gate_mlp = MLP(1, hidden_dim, hidden_dim)
+            self.salt_gate_mlp = MLP(1, hidden_dim, hidden_dim)
 
+        # New SOTA
         self.readout = nn.Sequential(
-            BaseMLP_2(hidden_dim + 2, hidden_dim + 2, hidden_dim + 2,
-                      num_layer=num_mlp_layer, residual=True, last_act=True),
-            BaseMLP_2(hidden_dim + 2, hidden_dim, 1, activation=nn.Softplus(), last_act=True)
+            nn.Linear(hidden_dim+2, hidden_dim),
+            nn.SiLU(),
+            nn.LayerNorm(hidden_dim),
+            MLP(hidden_dim, hidden_dim, hidden_dim, num_layers=3),
+            nn.SiLU(),
+            nn.LayerNorm(hidden_dim),
+            MLP(hidden_dim, hidden_dim+2, 1, num_layers=4),
+            nn.Softplus(),
         )
 
         # Static structure cache
@@ -353,13 +306,11 @@ class SolvMix(nn.Module):
             if cache is not None:
                 cache['inter_edge_index'] = inter_edge_index
 
-        if self.atom_interaction_module is not None:
-            h_atom = self.atom_interaction_module(h_atom, inter_edge_index)
-
-        h_graph = scatter_mean(h_atom, n2g_indices, dim=0)
+        h_graph = self.atom_to_token_pool(h_atom, inter_edge_index, n2g_indices)
 
         if self.use_amount_and_type_emb:
-            _n_solv = num_solvent_graphs if num_solvent_graphs is not None else (ratios.shape[0] if ratios is not None else 0)
+            _n_solv = num_solvent_graphs if num_solvent_graphs is not None else (
+                ratios.shape[0] if ratios is not None else 0)
             # type embedding
             token_types = torch.zeros(h_graph.size(0), dtype=torch.long, device=h_graph.device)
             if _n_solv < h_graph.size(0):
@@ -381,7 +332,8 @@ class SolvMix(nn.Module):
             if cache is not None and 'num_solvent_graphs' in cache:
                 _n_solv = cache['num_solvent_graphs']
             else:
-                _n_solv = num_solvent_graphs if num_solvent_graphs is not None else (ratios.shape[0] if ratios is not None else 0)
+                _n_solv = num_solvent_graphs if num_solvent_graphs is not None else (
+                    ratios.shape[0] if ratios is not None else 0)
                 if cache is not None:
                     cache['num_solvent_graphs'] = _n_solv
 
@@ -465,7 +417,8 @@ class SolvMix(nn.Module):
         valid_len = (~padding_mask).sum(dim=1, keepdim=True)
         h_sample = h_component.sum(dim=1) / valid_len.clamp(min=1)
 
-        feature_all = torch.cat([self.pool_proj(h_sample), T.unsqueeze(1) / 273.15, (273.15 / T.clamp_min(1e-8)).unsqueeze(1)], dim=1)
+        feature_all = torch.cat([self.pool_proj(h_sample), T.unsqueeze(1) / 273.15,
+                                (273.15 / T.clamp_min(1e-8)).unsqueeze(1)], dim=1)
 
         res = self.readout(feature_all).squeeze(1)
 

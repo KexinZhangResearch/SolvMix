@@ -1,12 +1,19 @@
 # @package _global_
 # Debug experiment
-exp_name: DEBUG
+exp_name: 5e-4-0.99985-adamw-clip0.25
 
 model:
   use_amount_scale: true
   use_amount_and_type_emb: true
+  cond_mode: late_concat
+  token_pool: mean
+
 
 train:
-  epochs: 20000
+  learning_rate: 5.0e-4
+  lr_gamma: 0.99985
+  optimizer: AdamW
+  grad_clip_val: 0.25
+  epochs: 50000
 
 wandb_api_key: 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
