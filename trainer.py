@@ -23,12 +23,12 @@ class SolvMixWrapper(pl.LightningModule):
 
         m_cfg = cfg.model
         self.model = SolvMix(
-            num_gnn_blocks=m_cfg.num_gnn_blocks,
+            no_blocks_gnn_encoder=m_cfg.num_gnn_blocks,
             node_input_dim=152,
             edge_attr_dim=13,
             hidden_dim=m_cfg.hidden_dim,
             num_mlp_layer=m_cfg.num_mlp_layer,
-            num_token_blocks=m_cfg.num_token_blocks,
+            no_blocks_token_interaction_module=m_cfg.num_token_blocks,
             num_atten_head=m_cfg.num_atten_head,
             num_atom_blocks=m_cfg.num_atom_blocks,
             seq_len=cfg.data.seq_len,
@@ -56,6 +56,9 @@ class SolvMixWrapper(pl.LightningModule):
             batch.get("pos_idx"),
             batch.get("seq_len"),
             batch.get("num_solvent_graphs"),
+            batch.get("inter_edge_index"),
+            batch.get("padding_mask"),
+            batch.get("scatter_indices"),
         )
 
     def training_step(self, batch, batch_idx):
@@ -156,7 +159,7 @@ def main(cfg: DictConfig) -> None:
     if getattr(cfg, "wandb_api_key", None):
         os.environ["WANDB_API_KEY"] = cfg.wandb_api_key
 
-    if cfg.data.num_workers > 0:
+    if cfg.data.batch_size is not None and cfg.data.num_workers > 0:
         import torch.multiprocessing as mp
         try:
             mp.set_start_method("spawn", force=True)
@@ -224,8 +227,7 @@ def main(cfg: DictConfig) -> None:
 
     model = SolvMixWrapper(cfg)
 
-    if cfg.data.batch_size is None:
-        model.model.enable_cache()
+    # Static structures are now precomputed in the batch; no model cache needed
 
     if cfg.compile and hasattr(torch, "compile"):
         try:
