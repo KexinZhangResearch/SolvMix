@@ -26,7 +26,6 @@ def build_dataloaders(cfg):
     data_cfg = cfg.data
     dataset = RDKit2DConductivityDatasetOptimized(
         dataset_name=data_cfg.dataset_name,
-        max_samples=data_cfg.max_samples,
     )
 
     total = len(dataset)
@@ -47,7 +46,7 @@ def build_dataloaders(cfg):
         timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
         cache_dir = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "..", "cache",
-            f"full_batch_{data_cfg.max_samples}_seq{data_cfg.seq_len}_{timestamp}"
+            f"full_batch_seq{data_cfg.seq_len}_{timestamp}"
         )
         os.makedirs(cache_dir, exist_ok=True)
 
@@ -66,7 +65,7 @@ def build_dataloaders(cfg):
         train_loader = get_cached_batch(train_set, "train")
         val_loader = get_cached_batch(val_set, "val")
         test_loader = get_cached_batch(test_set, "test")
-        print("[v5] Full-batch mode: static structures will be cached during forward")
+        print("[v5] Full-batch mode: static structures precomputed in batch")
     else:
         dataloader_args = {
             'batch_size': data_cfg.batch_size,

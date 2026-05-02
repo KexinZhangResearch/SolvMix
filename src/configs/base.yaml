@@ -15,7 +15,6 @@ compile: false
 data:
   dataset_name: GeoMix_CALiSol
   batch_size: null
-  max_samples: 100000
   num_workers: 8
   seq_len: 16
   train_ratio: 0.7

@@ -12,6 +12,8 @@ from rdkit import Chem
 from torch.utils.data import Dataset
 from torch_geometric.data import Batch, Data
 
+from .utils import get_intergraph_edge_index
+
 # ---------------------------------------------------------------------------
 # Path resolution
 # ---------------------------------------------------------------------------
@@ -20,17 +22,6 @@ _PROJECT_DIR = os.path.dirname(_MODULE_DIR)
 RAW_DIR = os.path.join(_PROJECT_DIR, "raw")
 PROCESSED_DIR = os.path.join(_PROJECT_DIR, "processed")
 os.makedirs(PROCESSED_DIR, exist_ok=True)
-
-
-# ---------------------------------------------------------------------------
-# Salt vocabulary
-# ---------------------------------------------------------------------------
-salt_list = [
-    'LiPF6', 'LiBF4', 'LiFSI', 'LiTDI', 'LiPDI', 'LiTFSI',
-    'LiClO4', 'LiAsF6', 'LiBOB', 'LiCF3SO3', 'LiBPFPB', 'LiBMB', 'LiN(CF3SO2)2'
-]
-
-_salt_to_idx = {name: i for i, name in enumerate(salt_list)}
 
 
 # ---------------------------------------------------------------------------
@@ -160,10 +151,9 @@ def _open_json(path: str):
 # Dataset
 # ---------------------------------------------------------------------------
 class RDKit2DConductivityDatasetOptimized(Dataset):
-    def __init__(self, dataset_name: str = "GeoMix_CALiSol", max_samples: int = 100_000, device: str = "cpu"):
+    def __init__(self, dataset_name: str = "GeoMix_CALiSol", device: str = "cpu"):
         super().__init__()
         self.dataset_name = dataset_name
-        self.max_samples = int(max_samples)
         self.device = device
         self.raw_data = self.load_dataset()
 
@@ -185,7 +175,7 @@ class RDKit2DConductivityDatasetOptimized(Dataset):
 
         print("Processing data...")
         dataset_process_path = os.path.join(
-            PROCESSED_DIR, f"{dataset_name}_rdkit_v5_max{self.max_samples}.pkl"
+            PROCESSED_DIR, f"{dataset_name}_rdkit_v5.pkl"
         )
         if os.path.exists(dataset_process_path):
             with open(dataset_process_path, 'rb') as f:
@@ -204,10 +194,12 @@ class RDKit2DConductivityDatasetOptimized(Dataset):
     def __getitem__(self, idx):
         item = self.data[idx]
         solvent_graphs = []
-        for name in item['solvent_names']:
+        solvent_ratios = []
+        for name, ratio in zip(item['solvent_names'], item['ratios']):
             g = self._graph_cache.get(name)
             if g is not None:
                 solvent_graphs.append(g)
+                solvent_ratios.append(ratio)
         salt_graph = self._graph_cache.get(item['salt'], None)
         return {
             'k': item['k'],
@@ -216,14 +208,14 @@ class RDKit2DConductivityDatasetOptimized(Dataset):
             'salt': item['salt'],
             'graphs': solvent_graphs,
             'salt_graphs': [salt_graph] if salt_graph is not None else [],
-            'ratios': torch.tensor(item['ratios'], dtype=torch.float32),
+            'ratios': torch.tensor(solvent_ratios, dtype=torch.float32),
         }
 
     def load_dataset(self):
         path = _resolve_data_path(self.dataset_name)
         with _open_json(path) as f:
             data = json.load(f)
-        return data[:self.max_samples]
+        return data
 
     def process(self, raw_data):
         processed = []
@@ -276,15 +268,11 @@ def solv_mix_collate_fn_optimized(batch, device='cpu', seq_len=8):
     y_values = torch.empty(batch_size, dtype=torch.float32)
     T_values = torch.empty(batch_size, dtype=torch.float32)
     c_values = torch.empty(batch_size, dtype=torch.float32)
-    salt_one_hot = torch.zeros(batch_size, len(salt_list), dtype=torch.float32)
 
     for idx, item in enumerate(batch):
         y_values[idx] = item['k']
         T_values[idx] = item['T']
         c_values[idx] = item['c']
-        sidx = _salt_to_idx.get(item['salt'], -1)
-        if sidx >= 0:
-            salt_one_hot[idx, sidx] = 1.0
 
     all_solvent_graphs = []
     all_salt_graphs = []
@@ -378,11 +366,20 @@ def solv_mix_collate_fn_optimized(batch, device='cpu', seq_len=8):
 
     num_solvent_graphs = len(all_solvent_graphs)
 
-    return {
+    # Precompute static structures for the batch
+    inter_edge_index = get_intergraph_edge_index(n2g_indices, n2b_indices)
+
+    scatter_indices = None
+    occupied = torch.zeros(batch_size, seq_len, dtype=torch.bool)
+    if g2b_indices.numel() > 0 and pos_idx.numel() > 0:
+        scatter_indices = g2b_indices * seq_len + pos_idx
+        occupied.view(-1)[scatter_indices] = True
+    padding_mask = ~occupied
+
+    result = {
         'y': y_values.to(device, non_blocking=True),
         'T': T_values.to(device, non_blocking=True),
         'c': c_values.to(device, non_blocking=True),
-        'salt_one_hot': salt_one_hot.to(device, non_blocking=True),
         'batch': batch_solvents.to(device),
         'salt_batch': batch_salts.to(device),
         'n2g_indices': n2g_indices.to(device),
@@ -392,4 +389,9 @@ def solv_mix_collate_fn_optimized(batch, device='cpu', seq_len=8):
         'pos_idx': pos_idx.to(device),
         'seq_len': seq_len,
         'num_solvent_graphs': num_solvent_graphs,
+        'inter_edge_index': inter_edge_index.to(device),
+        'padding_mask': padding_mask.to(device),
     }
+    if scatter_indices is not None:
+        result['scatter_indices'] = scatter_indices.to(device)
+    return result
